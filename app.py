@@ -16,6 +16,7 @@ st.markdown(
 <style>
     .signal-spy {background: linear-gradient(135deg, #10b981, #059669); color: white; padding: 0.85rem; border-radius: 10px; font-weight: 800; text-align: center; font-size: 1.25rem;}
     .signal-def {background: linear-gradient(135deg, #dc2626, #b91c1c); color: white; padding: 0.85rem; border-radius: 10px; font-weight: 800; text-align: center; font-size: 1.25rem;}
+    .signal-hold {background: linear-gradient(135deg, #f59e0b, #d97706); color: white; padding: 0.85rem; border-radius: 10px; font-weight: 800; text-align: center; font-size: 1.25rem;}
     .subtle {opacity: 0.9; font-size: 0.95rem; font-weight: 500;}
 </style>
 """,
@@ -59,18 +60,16 @@ def fetch_adj_close(tickers: list[str], start: str, end: str) -> pd.DataFrame:
         close = px["Close"].to_frame(tickers[0])
     else:
         close = px["Close"].copy()
+
     close.index = pd.to_datetime(close.index)
     close = close.sort_index()
     close = close.dropna(how="all")
     return close
 
 # ============================================================
-# CORE: SPY TRIGGER (simple, effective)
+# CORE: SPY TRIGGER
 # ============================================================
 def spy_trigger(spy: pd.Series, fast: int, slow: int, smooth: int) -> pd.Series:
-    """
-    PPO-ish line: (EMAfast - EMAslow) / EMAslow * 100
-    """
     fe = ema(spy, fast)
     se = ema(spy, slow)
     line = (fe - se) / se * 100.0
@@ -79,46 +78,21 @@ def spy_trigger(spy: pd.Series, fast: int, slow: int, smooth: int) -> pd.Series:
     return line
 
 def make_osc_look(line: pd.Series, look_window: int, visual_range: float, sensitivity: float) -> pd.Series:
-    """
-    Purely visual. Keeps the oscillator in a stable +/- band.
-    """
     std = line.rolling(look_window, min_periods=max(30, look_window // 3)).std()
     z = line / std.replace(0, np.nan)
     z = z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return pd.Series(visual_range * np.tanh(z / sensitivity), index=line.index)
 
 # ============================================================
-# INTERNALS: CONTEXT (NOT TRIGGERS)
+# INTERNALS: HEALTH SCORE (SIZING ONLY)
 # ============================================================
 def build_health_score(closes: pd.DataFrame, zwin: int) -> pd.Series:
-    """
-    Health score (higher = healthier):
-      - SPY:VXX roc20 (vol suppression / fear)
-      - HYG:LQD roc20 (credit appetite)
-      - RSP:SPY roc20 (participation breadth proxy)
-      - XLF:SPY roc20 (leadership/stress proxy)
-    """
     df = pd.DataFrame(index=closes.index)
 
-    if "VXX" in closes.columns:
-        df["spy_vxx"] = safe_div(closes["SPY"], closes["VXX"])
-    else:
-        df["spy_vxx"] = np.nan
-
-    if "HYG" in closes.columns and "LQD" in closes.columns:
-        df["hyg_lqd"] = safe_div(closes["HYG"], closes["LQD"])
-    else:
-        df["hyg_lqd"] = np.nan
-
-    if "RSP" in closes.columns:
-        df["rsp_spy"] = safe_div(closes["RSP"], closes["SPY"])
-    else:
-        df["rsp_spy"] = np.nan
-
-    if "XLF" in closes.columns:
-        df["xlf_spy"] = safe_div(closes["XLF"], closes["SPY"])
-    else:
-        df["xlf_spy"] = np.nan
+    df["spy_vxx"] = safe_div(closes["SPY"], closes["VXX"]) if "VXX" in closes.columns else np.nan
+    df["hyg_lqd"] = safe_div(closes["HYG"], closes["LQD"]) if ("HYG" in closes.columns and "LQD" in closes.columns) else np.nan
+    df["rsp_spy"] = safe_div(closes["RSP"], closes["SPY"]) if "RSP" in closes.columns else np.nan
+    df["xlf_spy"] = safe_div(closes["XLF"], closes["SPY"]) if "XLF" in closes.columns else np.nan
 
     for c in ["spy_vxx", "hyg_lqd", "rsp_spy", "xlf_spy"]:
         df[c + "_roc20"] = df[c].pct_change(20) * 100.0
@@ -128,16 +102,15 @@ def build_health_score(closes: pd.DataFrame, zwin: int) -> pd.Series:
         zs.append(rolling_z(df[c], zwin))
 
     hs = pd.concat(zs, axis=1).mean(axis=1)
-    hs = ema(hs, 5)  # smooth
+    hs = ema(hs, 5)
     return hs
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST
 # ============================================================
 def backtest(
     closes: pd.DataFrame,
     defensive_ticker: str,
-    use_defensive_etf: bool,
     line: pd.Series,
     deadband: float,
     trend_filter_ma: int,
@@ -146,42 +119,36 @@ def backtest(
     health_threshold: float,
     weak_weight: float,
     trade_cost_bps: float,
+    look_window: int,
+    visual_range: float,
+    sensitivity: float,
 ) -> pd.DataFrame:
     """
-    Strategy:
-      - Base signal: line > +deadband => SPY
-                    line < -deadband => DEF
-                    else => HOLD PRIOR (reduces whipsaw)
-      - Optional trend filter: only allow SPY if SPY > MA(trend_filter_ma)
-      - Defensive:
-          - if use_defensive_etf: DEF = defensive_ticker (e.g., AGG/GLD/SHY/BIL)
-          - else: use BIL as "cash proxy" (must exist in closes)
-      - Execution: signal at t applies to returns at t+1 (lag)
-      - Optional internals sizing: when in SPY, if health_score < threshold => reduce SPY weight to weak_weight
-      - Trading cost: cost applied on days where position changes (bps)
+    Signal logic:
+      - if line > +deadband and trend_ok => SPY
+      - if line < -deadband             => DEF
+      - else                            => HOLD prior
+    Execution:
+      - Held = Signal.shift(1) (no lookahead)
     """
     df = pd.DataFrame(index=closes.index).copy()
     df["SPY"] = closes["SPY"]
-
-    # defensive series
-    df["DEF"] = closes[defensive_ticker]  # defensive_ticker is already set to BIL if "cash proxy"
+    df["DEF"] = closes[defensive_ticker]
     df = df.dropna(subset=["SPY", "DEF"])
 
-    # trend filter
     df["spy_ma"] = df["SPY"].rolling(trend_filter_ma, min_periods=trend_filter_ma).mean()
     df["trend_ok"] = df["SPY"] > df["spy_ma"]
 
-    # raw line
     df["line"] = line.reindex(df.index)
     df = df.dropna(subset=["line", "spy_ma"])
 
-    # build stateful signal with deadband (hold prior inside band)
+    # Stateful signal with deadband + trend filter
     sig = pd.Series(index=df.index, dtype="object")
-    sig.iloc[0] = "DEF"  # start defensive until proven otherwise
+    sig.iloc[0] = "DEF"
 
     for i in range(1, len(df)):
         prev = sig.iloc[i - 1]
-        v = df["line"].iloc[i]
+        v = float(df["line"].iloc[i])
         trend_ok = bool(df["trend_ok"].iloc[i])
 
         if v > deadband and trend_ok:
@@ -192,51 +159,49 @@ def backtest(
             sig.iloc[i] = prev
 
     df["Signal"] = sig
-
-    # lag execution (no lookahead)
     df["Held"] = df["Signal"].shift(1)
     df = df.dropna(subset=["Held"])
 
-    # returns
+    # Returns
     df["spy_ret"] = df["SPY"].pct_change().fillna(0.0)
     df["def_ret"] = df["DEF"].pct_change().fillna(0.0)
 
-    # weights
+    # Health sizing (only affects SPY exposure when Held == SPY)
     if use_health_sizing:
         hs = health_score.reindex(df.index)
         df["health"] = hs
-        df["spy_w"] = np.where(df["Held"] == "SPY",
-                               np.where(df["health"] < health_threshold, weak_weight, 1.0),
-                               0.0)
+        df["spy_w"] = np.where(
+            df["Held"] == "SPY",
+            np.where(df["health"] < health_threshold, weak_weight, 1.0),
+            0.0,
+        )
     else:
         df["health"] = np.nan
         df["spy_w"] = np.where(df["Held"] == "SPY", 1.0, 0.0)
 
     df["def_w"] = 1.0 - df["spy_w"]
 
-    # gross strategy return
     df["gross_ret"] = df["spy_w"] * df["spy_ret"] + df["def_w"] * df["def_ret"]
 
-    # trading cost on position changes (bps => fraction)
-    # cost triggers when Held changes vs prior Held
+    # Trading cost on switches (Held changes)
     df["turnover"] = (df["Held"] != df["Held"].shift(1)).fillna(False).astype(int)
     cost = (trade_cost_bps / 10000.0) * df["turnover"]
     df["net_ret"] = df["gross_ret"] - cost
 
-    # equity curves
+    # Equity curves
     df["strat_cum"] = (1.0 + df["net_ret"]).cumprod() * 100.0
     df["buyhold_cum"] = (1.0 + df["spy_ret"]).cumprod() * 100.0
     df["def_cum"] = (1.0 + df["def_ret"]).cumprod() * 100.0
 
-    # oscillator display and cross markers (for visualization only)
-    df["Osc"] = make_osc_look(df["line"], look_window=126, visual_range=3.0, sensitivity=1.5)
+    # Visual oscillator + cross markers (visual only)
+    df["Osc"] = make_osc_look(df["line"], look_window=look_window, visual_range=visual_range, sensitivity=sensitivity)
     df["CrossUp"] = (df["Osc"] > 0) & (df["Osc"].shift(1) <= 0)
     df["CrossDn"] = (df["Osc"] < 0) & (df["Osc"].shift(1) >= 0)
 
     return df
 
 # ============================================================
-# PLOTS
+# PLOT
 # ============================================================
 def plot_dashboard(df: pd.DataFrame, defensive_label: str) -> go.Figure:
     fig = make_subplots(
@@ -244,10 +209,10 @@ def plot_dashboard(df: pd.DataFrame, defensive_label: str) -> go.Figure:
         row_heights=[0.55, 0.25, 0.20], vertical_spacing=0.05
     )
 
-    # price
+    # Price
     fig.add_trace(go.Scatter(x=df.index, y=df["SPY"], name="SPY", line=dict(width=2)), row=1, col=1)
 
-    # shade regimes by Held
+    # Shade by Held
     hold = df["Held"]
     changes = (hold != hold.shift(1)).fillna(True)
     starts = list(df.index[changes])
@@ -258,7 +223,7 @@ def plot_dashboard(df: pd.DataFrame, defensive_label: str) -> go.Figure:
         col = "rgba(16,185,129,0.12)" if hold.loc[s] == "SPY" else "rgba(220,38,38,0.12)"
         fig.add_vrect(x0=s, x1=e, fillcolor=col, opacity=0.5, layer="below", line_width=0)
 
-    # oscillator pane
+    # Oscillator
     fig.add_trace(go.Bar(x=df.index, y=df["Osc"], name="Signal (osc)", opacity=0.85), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["Osc"], name="Osc line", line=dict(width=2)), row=2, col=1)
     fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
@@ -272,11 +237,10 @@ def plot_dashboard(df: pd.DataFrame, defensive_label: str) -> go.Figure:
         fig.add_trace(go.Scatter(x=dns.index, y=dns["Osc"], mode="markers", name=f"Cross↓→{defensive_label}",
                                  marker=dict(size=9, symbol="triangle-down")), row=2, col=1)
 
-    # equity curves
+    # Equity curves
     fig.add_trace(go.Scatter(x=df.index, y=df["strat_cum"], name="Strategy", line=dict(width=2)), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["buyhold_cum"], name="SPY Buy/Hold", line=dict(width=2)), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["def_cum"], name=f"{defensive_label} Buy/Hold", line=dict(width=1.5)),
-                  row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["def_cum"], name=f"{defensive_label} Buy/Hold", line=dict(width=1.5)), row=3, col=1)
 
     fig.update_layout(
         height=860, hovermode="x unified", bargap=0,
@@ -286,36 +250,35 @@ def plot_dashboard(df: pd.DataFrame, defensive_label: str) -> go.Figure:
     fig.update_yaxes(title_text="SPY Price", row=1, col=1)
     fig.update_yaxes(title_text="Osc (0-line)", row=2, col=1)
     fig.update_yaxes(title_text="Equity (Start=100)", row=3, col=1)
-
     return fig
 
 # ============================================================
 # APP
 # ============================================================
 def main():
-    st.title("🔄 Efficient SPY Regime + Cash/ETF Defensive (15Y)")
+    st.title("🔄 Efficient SPY Regime + Cash/ETF Defensive")
 
     with st.sidebar:
         st.header("⚙️ Backtest")
-        years = st.slider("History (years)", 10, 20, 15)
+
+        # ✅ FIX: allow 1-year backtest
+        years = st.slider("History (years)", 1, 20, 15)
 
         st.subheader("SPY Trigger (simple)")
         fast = st.slider("Fast EMA", 2, 30, 5)
         slow = st.slider("Slow EMA", 5, 80, 13)
         smooth = st.slider("Signal smoothing (EMA)", 1, 30, 5)
 
-        st.subheader("Whipsaw Control (big deal)")
-        deadband = st.slider("Deadband around 0", 0.0, 1.5, 0.25, 0.05,
-                             help="Inside +/- deadband the system holds prior position. Reduces churn.")
-        trend_ma = st.slider("Trend filter MA (days)", 50, 300, 200, 10,
-                             help="Only allow SPY when SPY > MA. Helps avoid bear-market chop.")
+        st.subheader("Whipsaw Control")
+        deadband = st.slider("Deadband around 0", 0.0, 1.5, 0.25, 0.05)
+        trend_ma = st.slider("Trend filter MA (days)", 50, 300, 200, 10)
 
         st.subheader("Defensive")
         use_etf = st.toggle("Use defensive ETF (instead of cash proxy)", value=False)
         def_ticker = st.text_input("Defensive ticker (AGG / GLD / SHY / etc)", value="AGG").strip().upper()
-
-        # cash proxy = BIL by default (real series; better than fake interest rate)
         cash_proxy = st.selectbox("Cash proxy ticker", ["BIL", "SHY", "SGOV"], index=0)
+        defensive_ticker = def_ticker if use_etf else cash_proxy
+        defensive_label = defensive_ticker
 
         st.subheader("Internals (sizing only)")
         use_health = st.toggle("Reduce SPY size when internals weak", value=True)
@@ -324,8 +287,12 @@ def main():
         weak_w = st.slider("SPY weight when weak", 0.0, 1.0, 0.5, 0.05)
 
         st.subheader("Realism")
-        trade_cost_bps = st.slider("Trading cost (bps per switch)", 0.0, 20.0, 2.0, 0.5,
-                                   help="Applied each time Held position changes (lagged).")
+        trade_cost_bps = st.slider("Trading cost (bps per switch)", 0.0, 20.0, 2.0, 0.5)
+
+        st.subheader("Oscillator LOOK (visual only)")
+        look_window = st.slider("Look window (rolling std days)", 30, 252, 126, 7)
+        visual_range = st.slider("Visual range (+/-)", 1.0, 8.0, 3.0, 0.5)
+        sensitivity = st.slider("Sensitivity (lower=more swing)", 0.5, 3.0, 1.5, 0.1)
 
         if st.button("🔄 Refresh / clear cache", use_container_width=True):
             st.cache_data.clear()
@@ -336,10 +303,6 @@ def main():
     end = datetime.now().date() + timedelta(days=1)
     start = (datetime.now() - timedelta(days=int(365.25 * years))).date()
 
-    # Determine defensive ticker used in backtest
-    defensive_ticker = def_ticker if use_etf else cash_proxy
-    defensive_label = defensive_ticker
-
     tickers = sorted(list(set([
         "SPY",
         defensive_ticker,
@@ -348,27 +311,29 @@ def main():
 
     try:
         closes = fetch_adj_close(tickers, start=str(start), end=str(end))
+
         if "SPY" not in closes.columns or defensive_ticker not in closes.columns:
-            st.error("Missing required data from yfinance (SPY or defensive ticker). Try another defensive ticker.")
+            st.error("Missing required data (SPY or defensive ticker). Try another defensive ticker.")
             return
 
         line = spy_trigger(closes["SPY"], fast=fast, slow=slow, smooth=smooth)
-        hs = build_health_score(closes, zwin=zwin) if use_health else None
+        hs = build_health_score(closes, zwin=zwin) if use_health else pd.Series(index=closes.index, dtype=float)
 
         df = backtest(
             closes=closes,
             defensive_ticker=defensive_ticker,
-            use_defensive_etf=use_etf,
             line=line,
             deadband=deadband,
             trend_filter_ma=trend_ma,
             use_health_sizing=use_health,
-            health_score=hs if hs is not None else pd.Series(index=closes.index, dtype=float),
+            health_score=hs,
             health_threshold=health_th,
             weak_weight=weak_w,
             trade_cost_bps=trade_cost_bps,
+            look_window=look_window,
+            visual_range=visual_range,
+            sensitivity=sensitivity,
         )
-
     except Exception as e:
         st.error(f"Error: {e}")
         st.stop()
@@ -377,20 +342,30 @@ def main():
 
     with tab1:
         last = df.iloc[-1]
-        today_signal = "SPY" if last["line"] > deadband and bool((last["SPY"] > last["spy_ma"])) else defensive_label
-        held = last["Held"]
 
-        if today_signal == "SPY":
+        # ✅ FIX: Current panel must match the backtest state (Signal + Held)
+        signal_today = last["Signal"]                 # model decision today (pre-lag)
+        held_today = last["Held"]                     # what you actually hold today (lagged)
+        inside_deadband = (abs(float(last["line"])) <= deadband)
+
+        if inside_deadband:
             st.markdown(
-                f"""<div class="signal-spy">🟢 SPY ON
-                <div class="subtle">line={float(last["line"]):+.3f} • deadband=±{deadband:.2f} • held={held}</div>
+                f"""<div class="signal-hold">🟡 HOLD ({held_today})
+                <div class="subtle">line={float(last["line"]):+.3f} • deadband=±{deadband:.2f} • signal_today={signal_today} • held_today={held_today}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        elif signal_today == "SPY":
+            st.markdown(
+                f"""<div class="signal-spy">🟢 SIGNAL → SPY
+                <div class="subtle">line={float(last["line"]):+.3f} • deadband=±{deadband:.2f} • held_today={held_today}</div>
                 </div>""",
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
-                f"""<div class="signal-def">🔴 DEFENSIVE → {defensive_label}
-                <div class="subtle">line={float(last["line"]):+.3f} • deadband=±{deadband:.2f} • held={held}</div>
+                f"""<div class="signal-def">🔴 SIGNAL → {defensive_label}
+                <div class="subtle">line={float(last["line"]):+.3f} • deadband=±{deadband:.2f} • held_today={held_today}</div>
                 </div>""",
                 unsafe_allow_html=True,
             )
@@ -401,9 +376,9 @@ def main():
         with c2:
             st.metric(defensive_label, f"{last['DEF']:.2f}")
         with c3:
-            st.metric("Held (no lookahead)", held)
+            st.metric("Held today (no lookahead)", held_today)
         with c4:
-            if "health" in df.columns and pd.notna(last.get("health", np.nan)):
+            if pd.notna(last.get("health", np.nan)):
                 st.metric("Health", f"{float(last['health']):+.2f}")
             else:
                 st.metric("Health", "—")
@@ -429,7 +404,7 @@ def main():
             st.metric("Rotations", f"{rotations}")
 
         with st.expander("Recent rows"):
-            cols = ["SPY", "DEF", "line", "Osc", "Held", "spy_w", "gross_ret", "net_ret", "strat_cum", "buyhold_cum"]
+            cols = ["SPY", "DEF", "line", "Osc", "Signal", "Held", "spy_w", "gross_ret", "net_ret", "strat_cum", "buyhold_cum", "turnover"]
             cols = [c for c in cols if c in df.columns]
             st.dataframe(df[cols].tail(40), use_container_width=True)
 
