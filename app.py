@@ -142,7 +142,6 @@ def backtest(
     df["line"] = line.reindex(df.index)
     df = df.dropna(subset=["line", "spy_ma"])
 
-    # Stateful signal with deadband + trend filter
     sig = pd.Series(index=df.index, dtype="object")
     sig.iloc[0] = "DEF"
 
@@ -162,11 +161,9 @@ def backtest(
     df["Held"] = df["Signal"].shift(1)
     df = df.dropna(subset=["Held"])
 
-    # Returns
     df["spy_ret"] = df["SPY"].pct_change().fillna(0.0)
     df["def_ret"] = df["DEF"].pct_change().fillna(0.0)
 
-    # Health sizing (only affects SPY exposure when Held == SPY)
     if use_health_sizing:
         hs = health_score.reindex(df.index)
         df["health"] = hs
@@ -180,20 +177,16 @@ def backtest(
         df["spy_w"] = np.where(df["Held"] == "SPY", 1.0, 0.0)
 
     df["def_w"] = 1.0 - df["spy_w"]
-
     df["gross_ret"] = df["spy_w"] * df["spy_ret"] + df["def_w"] * df["def_ret"]
 
-    # Trading cost on switches (Held changes)
     df["turnover"] = (df["Held"] != df["Held"].shift(1)).fillna(False).astype(int)
     cost = (trade_cost_bps / 10000.0) * df["turnover"]
     df["net_ret"] = df["gross_ret"] - cost
 
-    # Equity curves
     df["strat_cum"] = (1.0 + df["net_ret"]).cumprod() * 100.0
     df["buyhold_cum"] = (1.0 + df["spy_ret"]).cumprod() * 100.0
     df["def_cum"] = (1.0 + df["def_ret"]).cumprod() * 100.0
 
-    # Visual oscillator + cross markers (visual only)
     df["Osc"] = make_osc_look(df["line"], look_window=look_window, visual_range=visual_range, sensitivity=sensitivity)
     df["CrossUp"] = (df["Osc"] > 0) & (df["Osc"].shift(1) <= 0)
     df["CrossDn"] = (df["Osc"] < 0) & (df["Osc"].shift(1) >= 0)
@@ -209,10 +202,8 @@ def plot_dashboard(df: pd.DataFrame, defensive_label: str) -> go.Figure:
         row_heights=[0.55, 0.25, 0.20], vertical_spacing=0.05
     )
 
-    # Price
     fig.add_trace(go.Scatter(x=df.index, y=df["SPY"], name="SPY", line=dict(width=2)), row=1, col=1)
 
-    # Shade by Held
     hold = df["Held"]
     changes = (hold != hold.shift(1)).fillna(True)
     starts = list(df.index[changes])
@@ -223,7 +214,6 @@ def plot_dashboard(df: pd.DataFrame, defensive_label: str) -> go.Figure:
         col = "rgba(16,185,129,0.12)" if hold.loc[s] == "SPY" else "rgba(220,38,38,0.12)"
         fig.add_vrect(x0=s, x1=e, fillcolor=col, opacity=0.5, layer="below", line_width=0)
 
-    # Oscillator
     fig.add_trace(go.Bar(x=df.index, y=df["Osc"], name="Signal (osc)", opacity=0.85), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["Osc"], name="Osc line", line=dict(width=2)), row=2, col=1)
     fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
@@ -231,13 +221,18 @@ def plot_dashboard(df: pd.DataFrame, defensive_label: str) -> go.Figure:
     ups = df[df["CrossUp"]]
     dns = df[df["CrossDn"]]
     if not ups.empty:
-        fig.add_trace(go.Scatter(x=ups.index, y=ups["Osc"], mode="markers", name="Cross↑",
-                                 marker=dict(size=9, symbol="triangle-up")), row=2, col=1)
+        fig.add_trace(
+            go.Scatter(x=ups.index, y=ups["Osc"], mode="markers", name="Cross↑",
+                       marker=dict(size=9, symbol="triangle-up")),
+            row=2, col=1
+        )
     if not dns.empty:
-        fig.add_trace(go.Scatter(x=dns.index, y=dns["Osc"], mode="markers", name=f"Cross↓→{defensive_label}",
-                                 marker=dict(size=9, symbol="triangle-down")), row=2, col=1)
+        fig.add_trace(
+            go.Scatter(x=dns.index, y=dns["Osc"], mode="markers", name=f"Cross↓→{defensive_label}",
+                       marker=dict(size=9, symbol="triangle-down")),
+            row=2, col=1
+        )
 
-    # Equity curves
     fig.add_trace(go.Scatter(x=df.index, y=df["strat_cum"], name="Strategy", line=dict(width=2)), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["buyhold_cum"], name="SPY Buy/Hold", line=dict(width=2)), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["def_cum"], name=f"{defensive_label} Buy/Hold", line=dict(width=1.5)), row=3, col=1)
@@ -261,7 +256,6 @@ def main():
     with st.sidebar:
         st.header("⚙️ Backtest")
 
-        # ✅ FIX: allow 1-year backtest
         years = st.slider("History (years)", 1, 20, 15)
 
         st.subheader("SPY Trigger (simple)")
@@ -270,7 +264,7 @@ def main():
         smooth = st.slider("Signal smoothing (EMA)", 1, 30, 5)
 
         st.subheader("Whipsaw Control")
-        deadband = st.slider("Deadband around 0", 0.0, 1.5, 0.25, 0.05)
+        deadband = st.slider("Deadband around 0", 0.0, 1.5, 0.25, 0.01)
         trend_ma = st.slider("Trend filter MA (days)", 50, 300, 200, 10)
 
         st.subheader("Defensive")
@@ -343,9 +337,8 @@ def main():
     with tab1:
         last = df.iloc[-1]
 
-        # ✅ FIX: Current panel must match the backtest state (Signal + Held)
-        signal_today = last["Signal"]                 # model decision today (pre-lag)
-        held_today = last["Held"]                     # what you actually hold today (lagged)
+        signal_today = last["Signal"]
+        held_today = last["Held"]
         inside_deadband = (abs(float(last["line"])) <= deadband)
 
         if inside_deadband:
@@ -403,10 +396,14 @@ def main():
         with col4:
             st.metric("Rotations", f"{rotations}")
 
-        with st.expander("Recent rows"):
+        with st.expander("Recent rows (last 6 months)"):
             cols = ["SPY", "DEF", "line", "Osc", "Signal", "Held", "spy_w", "gross_ret", "net_ret", "strat_cum", "buyhold_cum", "turnover"]
             cols = [c for c in cols if c in df.columns]
-            st.dataframe(df[cols].tail(40), use_container_width=True)
+
+            recent_start = df.index.max() - pd.DateOffset(months=6)
+            recent_df = df.loc[df.index >= recent_start, cols]
+
+            st.dataframe(recent_df, use_container_width=True)
 
 if __name__ == "__main__":
     main()
