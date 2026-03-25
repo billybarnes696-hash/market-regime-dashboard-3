@@ -1,6 +1,8 @@
 import io
 import json
+import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -9,7 +11,11 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from openai import OpenAI
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 
 # ============================================================
@@ -17,7 +23,7 @@ from openai import OpenAI
 # ============================================================
 st.set_page_config(page_title="Breadth Engine vNext", layout="wide")
 st.title("Breadth Engine vNext")
-st.caption("Stateful breadth workstation: baseline memory + rolling uploads + weekly + ChatGPT API")
+st.caption("Stateful breadth workstation: baseline memory + rolling uploads + weekly + optional ChatGPT API")
 
 
 # ============================================================
@@ -47,41 +53,44 @@ DEFAULT_THRESHOLDS = {
     "SPXADP_THRUST": 60.0,
     "CPCE_FEAR": 0.80,
     "NYHL_POSITIVE": 0.0,
-    "FAILED_BOUNCE_VXX_UP": 0.0,
-    "FAILED_BOUNCE_RSP_SPY_DOWN": 0.0,
 }
 
 
 # ============================================================
-# CONSTANTS
+# SYMBOLS
 # ============================================================
 CORE_SYMBOLS = [
-    "$BPNYA",
     "$BPSPX",
-    "$CPCE",
-    "$NYAD",
-    "$NYHL",
+    "$SPXA50R",
     "$NYMO",
     "$NYSI",
+    "$NYAD",
+    "$SPXADP",
+    "$CPCE",
+    "$NYHL",
+    "RSP:SPY",
+    "VXX",
+]
+
+EXTENDED_SYMBOLS = [
+    "$BPNYA",
     "$OEXA150R",
     "$OEXA200R",
     "$OEXA50R",
     "$SPX",
-    "$SPXA50R",
-    "$SPXADP",
+    "RSP",
+    "SMH:SPY",
+    "XLF:SPY",
+    "IWM:SPY",
     "HYG:IEF",
     "HYG:TLT",
-    "IWM:SPY",
-    "RSP",
-    "RSP:SPY",
-    "SMH:SPY",
     "SPXS:SVOL",
     "URSP",
-    "VXX",
-    "XLF:SPY",
 ]
 
+ALL_SYMBOLS = CORE_SYMBOLS + [s for s in EXTENDED_SYMBOLS if s not in CORE_SYMBOLS]
 DEFAULT_MINIMAL_CHARTS = ["$BPSPX", "$SPXA50R", "$NYMO", "$NYSI", "RSP"]
+
 
 OHLC_PATTERN = re.compile(
     r"(?P<day>Mon|Tue|Wed|Thu|Fri)\s+"
@@ -114,12 +123,6 @@ def safe_float(x) -> float:
         return np.nan
 
 
-def bool_py(x) -> bool:
-    if pd.isna(x):
-        return False
-    return bool(x)
-
-
 def load_json(path: Path, default):
     if not path.exists():
         return default
@@ -141,26 +144,53 @@ def append_jsonl(path: Path, row: Dict):
 # ============================================================
 # OPENAI
 # ============================================================
-def get_openai_client() -> Tuple[Optional[OpenAI], Optional[str], Optional[str]]:
-    api_key = None
+def get_manual_api_key() -> Optional[str]:
+    return st.session_state.get("manual_api_key") or None
+
+
+def get_openai_client_and_model() -> Tuple[Optional[object], Optional[str], str]:
     model_name = "gpt-5.4"
+    api_key = None
 
     try:
-        if "OPENAI_API_KEY" in st.secrets:
-            api_key = st.secrets["OPENAI_API_KEY"]
         if "OPENAI_MODEL" in st.secrets:
             model_name = st.secrets["OPENAI_MODEL"]
+        if "OPENAI_API_KEY" in st.secrets:
+            api_key = st.secrets["OPENAI_API_KEY"]
     except Exception:
         pass
 
     if not api_key:
-        return None, None, model_name
+        api_key = os.environ.get("OPENAI_API_KEY")
+
+    if not api_key:
+        api_key = get_manual_api_key()
+
+    if not api_key or OpenAI is None:
+        return None, api_key, model_name
 
     try:
         client = OpenAI(api_key=api_key)
         return client, api_key, model_name
     except Exception:
         return None, api_key, model_name
+
+
+def call_openai_analysis(client, model_name: str, prompt: str, retries: int = 2) -> str:
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            response = client.responses.create(
+                model=model_name,
+                input=prompt,
+            )
+            return response.output_text
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                raise last_err
 
 
 # ============================================================
@@ -299,15 +329,10 @@ def add_indicator_features(hist: pd.DataFrame) -> pd.DataFrame:
         g["pct_b20"] = percent_b(g["close"], 20, 2.0)
         g["roc3"] = roc(g["close"], 3)
         g["roc5"] = roc(g["close"], 5)
-
         g["tsi_fast"], g["tsi_fast_sig"] = true_strength_index(g["close"], 4, 2, 4)
-        g["tsi_slow"], g["tsi_slow_sig"] = true_strength_index(g["close"], 25, 13, 7)
-
         g["ma20"] = g["close"].rolling(20).mean()
         g["ma50"] = g["close"].rolling(50).mean()
         g["ma200"] = g["close"].rolling(200).mean()
-
-        g["daily_change"] = g["close"].diff()
         g["daily_pct"] = g["close"].pct_change() * 100
 
         frames.append(g)
@@ -346,7 +371,7 @@ def get_prior_feature_snapshot(hist_feat: pd.DataFrame) -> Dict[str, float]:
 
 
 # ============================================================
-# REGIME LOGIC
+# REGIME / SCORE LOGIC
 # ============================================================
 def score_nyad(val: float, thresholds: Dict[str, float]) -> int:
     if pd.isna(val):
@@ -419,38 +444,16 @@ def breadth_stage(snapshot: Dict[str, float], thresholds: Dict[str, float]) -> T
 
     if pd.isna(bpspx_bb):
         return 0, "Unknown"
-
     if bpspx_bb < thresholds["BPSPX_BB_LIFT"]:
         return 0, "Washout / lower-band pressure"
     if bpspx_bb >= thresholds["BPSPX_BB_LIFT"] and (pd.isna(spxa50r) or spxa50r <= thresholds["SPXA50R_REPAIR"]):
         return 1, "Bounce starting"
-    if (
-        bpspx_bb > thresholds["BPSPX_BB_LIFT"]
-        and pd.notna(spxa50r)
-        and spxa50r > thresholds["SPXA50R_REPAIR"]
-        and (pd.isna(bpspx) or bpspx <= thresholds["BPSPX_CONFIRM"])
-    ):
+    if bpspx_bb > thresholds["BPSPX_BB_LIFT"] and pd.notna(spxa50r) and spxa50r > thresholds["SPXA50R_REPAIR"] and (pd.isna(bpspx) or bpspx <= thresholds["BPSPX_CONFIRM"]):
         return 2, "Breadth repair"
-    if (
-        bpspx_bb > thresholds["BPSPX_BB_LIFT"]
-        and pd.notna(spxa50r)
-        and spxa50r > thresholds["SPXA50R_REPAIR"]
-        and pd.notna(bpspx)
-        and bpspx > thresholds["BPSPX_CONFIRM"]
-        and (pd.isna(nysi) or nysi <= thresholds["NYSI_POSITIVE"])
-    ):
+    if bpspx_bb > thresholds["BPSPX_BB_LIFT"] and pd.notna(spxa50r) and spxa50r > thresholds["SPXA50R_REPAIR"] and pd.notna(bpspx) and bpspx > thresholds["BPSPX_CONFIRM"] and (pd.isna(nysi) or nysi <= thresholds["NYSI_POSITIVE"]):
         return 3, "Participation confirmation"
-    if (
-        bpspx_bb > thresholds["BPSPX_BB_LIFT"]
-        and pd.notna(spxa50r)
-        and spxa50r > thresholds["SPXA50R_REPAIR"]
-        and pd.notna(bpspx)
-        and bpspx > thresholds["BPSPX_CONFIRM"]
-        and pd.notna(nysi)
-        and nysi > thresholds["NYSI_POSITIVE"]
-    ):
+    if bpspx_bb > thresholds["BPSPX_BB_LIFT"] and pd.notna(spxa50r) and spxa50r > thresholds["SPXA50R_REPAIR"] and pd.notna(bpspx) and bpspx > thresholds["BPSPX_CONFIRM"] and pd.notna(nysi) and nysi > thresholds["NYSI_POSITIVE"]:
         return 4, "Trend durability / healthier regime"
-
     return 0, "Unknown"
 
 
@@ -619,35 +622,27 @@ def failed_bounce_risk(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[
     if stage_num <= 1:
         risk_points += 1
         reasons.append("Bounce still early-stage")
-
     if pd.notna(bpspx_bb) and bpspx_bb < thresholds["BPSPX_BB_LIFT"]:
         risk_points += 2
         reasons.append("BPSPX %B below repair lift")
-
     if pd.notna(prev_bpspx_bb) and pd.notna(bpspx_bb) and bpspx_bb < prev_bpspx_bb:
         risk_points += 1
         reasons.append("BPSPX %B deteriorating")
-
     if pd.notna(spxa50r) and spxa50r < thresholds["SPXA50R_REPAIR"]:
         risk_points += 1
         reasons.append("SPXA50R below repair threshold")
-
     if pd.notna(prev_spxa50r) and pd.notna(spxa50r) and spxa50r < prev_spxa50r:
         risk_points += 1
         reasons.append("SPXA50R weakening")
-
     if pd.notna(nymo) and nymo < thresholds["NYMO_HEALTHY"]:
         risk_points += 1
         reasons.append("NYMO still negative")
-
     if pd.notna(nysi) and nysi < thresholds["NYSI_LEVERAGE_OK"]:
         risk_points += 2
         reasons.append("NYSI still structurally damaged")
-
     if pd.notna(prev_rsp_spy) and pd.notna(rsp_spy) and rsp_spy < prev_rsp_spy:
         risk_points += 1
         reasons.append("RSP:SPY weakening")
-
     if pd.notna(prev_vxx) and pd.notna(vxx) and vxx > prev_vxx:
         risk_points += 1
         reasons.append("VXX rising")
@@ -677,10 +672,7 @@ def build_narrative(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str
     if pd.notna(bpspx_bb):
         parts.append(f"BPSPX Bollinger %B is {bpspx_bb:.2f}.")
 
-    if repair:
-        parts.append("Qwen repair trigger is active.")
-    else:
-        parts.append("Qwen repair trigger is not active.")
+    parts.append("Qwen repair trigger is active." if repair else "Qwen repair trigger is not active.")
 
     if short_probe_ok and failed_risk in {"MED", "HIGH"}:
         parts.append("Short probe is only attractive on failed-bounce conditions, not fresh panic lows.")
@@ -696,10 +688,8 @@ def build_narrative(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str
         parts.append(f"NYMO is {nymo:.2f}.")
     if pd.notna(nysi):
         parts.append(f"NYSI is {nysi:.2f}.")
-
     if notes:
         parts.append("Key supports / drags: " + "; ".join(notes) + ".")
-
     if failed_reasons:
         parts.append("Failed-bounce drivers: " + "; ".join(failed_reasons) + ".")
 
@@ -707,7 +697,7 @@ def build_narrative(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str
 
 
 # ============================================================
-# WEEKLY ANALYSIS
+# WEEKLY
 # ============================================================
 def weekly_analysis(hist_feat: pd.DataFrame) -> pd.DataFrame:
     rows = []
@@ -856,7 +846,152 @@ def intraday_multi_upload_analysis(history_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# CHART HELPERS
+# MOMENTUM CONTEXT
+# ============================================================
+def target_for_symbol(sym: str, thresholds: Dict[str, float]) -> str:
+    targets = {
+        "$BPSPX_%B": f">{thresholds['BPSPX_BB_LIFT']:.2f}",
+        "$SPXA50R": f">{thresholds['SPXA50R_REPAIR']:.0f}",
+        "$BPSPX": f">{thresholds['BPSPX_CONFIRM']:.0f}",
+        "$NYMO": f">{thresholds['NYMO_HEALTHY']:.0f}",
+        "$NYSI": f">{thresholds['NYSI_POSITIVE']:.0f}",
+        "$NYAD": f">{thresholds['NYAD_THRUST']:.0f}",
+        "$SPXADP": f">{thresholds['SPXADP_THRUST']:.0f}",
+        "$CPCE": f">={thresholds['CPCE_FEAR']:.2f}",
+        "$NYHL": f">{thresholds['NYHL_POSITIVE']:.0f}",
+        "RSP:SPY": "rising",
+        "VXX": "falling",
+        "SMH:SPY": "rising",
+        "XLF:SPY": "rising",
+        "IWM:SPY": "rising",
+    }
+    return targets.get(sym, "improving")
+
+
+def verbose_state(sym: str, cur: float, prev: float, thresholds: Dict[str, float]) -> str:
+    delta = cur - prev if pd.notna(cur) and pd.notna(prev) else np.nan
+
+    if pd.isna(cur):
+        return "missing"
+
+    improving = pd.notna(delta) and delta > 0
+    worsening = pd.notna(delta) and delta < 0
+
+    if sym == "$BPSPX_%B":
+        if cur < thresholds["BPSPX_BB_LIFT"]:
+            return "pinned low but creeping up" if improving else "pinned low and not yet repairing"
+        if cur < 0.50:
+            return "lifted off the lows and repairing"
+        return "well off the lows and broadening"
+
+    if sym == "$SPXA50R":
+        if cur < 25:
+            return "weak breadth depth and not yet repaired" if not improving else "weak breadth depth but improving"
+        if cur <= thresholds["SPXA50R_REPAIR"]:
+            return "near repair threshold and grinding higher" if improving else "near repair threshold but stalling"
+        return "repair passed and improving" if improving else "repair passed but momentum is flattening"
+
+    if sym == "$BPSPX":
+        if cur < 40:
+            return "washed out participation; bounce still fragile" if not improving else "washed out but repairing"
+        if cur <= thresholds["BPSPX_CONFIRM"]:
+            return "participation improving but not yet confirmed"
+        return "participation confirmed and healthier"
+
+    if sym == "$NYMO":
+        if cur < thresholds["NYMO_WASHOUT"]:
+            return "deep washout momentum"
+        if cur < thresholds["NYMO_HEALTHY"]:
+            return "negative momentum but repairing" if improving else "negative momentum and still vulnerable"
+        return "momentum recovered above healthy threshold"
+
+    if sym == "$NYSI":
+        if cur < thresholds["NYSI_LEVERAGE_OK"]:
+            return "structurally damaged trend and not leverage-ready" if not improving else "structurally damaged but improving"
+        if cur < thresholds["NYSI_POSITIVE"]:
+            return "still negative, but repair is building" if improving else "still negative and fragile"
+        return "trend backdrop positive and more durable"
+
+    if sym == "$NYAD":
+        if cur > thresholds["NYAD_THRUST"]:
+            return "strong breadth thrust day"
+        if cur > 300:
+            return "breadth positive but not a thrust"
+        if cur < -300:
+            return "negative breadth pressure"
+        return "flat to mixed breadth"
+
+    if sym == "$SPXADP":
+        if cur > thresholds["SPXADP_THRUST"]:
+            return "strong advancing-volume thrust"
+        if cur > 20:
+            return "positive breadth volume but not a thrust"
+        if cur < -20:
+            return "negative breadth volume pressure"
+        return "mixed breadth volume"
+
+    if sym == "$CPCE":
+        if cur >= thresholds["CPCE_FEAR"]:
+            return "fear elevated, which can support a bounce"
+        return "fear support fading"
+
+    if sym == "$NYHL":
+        if cur > thresholds["NYHL_POSITIVE"]:
+            return "new highs are outpacing lows"
+        return "new lows still dominating"
+
+    if sym == "VXX":
+        if worsening:
+            return "volatility rising, which pressures the bounce"
+        if improving:
+            return "volatility easing, which helps repair"
+        return "volatility mixed"
+
+    if sym in {"RSP:SPY", "SMH:SPY", "XLF:SPY", "IWM:SPY"}:
+        if improving:
+            return "leadership ratio improving"
+        if worsening:
+            return "leadership ratio weakening"
+        return "leadership ratio flat"
+
+    return "improving" if improving else "worsening" if worsening else "flat"
+
+
+def build_momentum_context_table(
+    symbols: List[str],
+    snapshot: Dict[str, float],
+    prev_snapshot: Dict[str, float],
+    thresholds: Dict[str, float],
+) -> pd.DataFrame:
+    rows = []
+
+    for sym in symbols:
+        key = sym
+        if sym in {"$BPSPX"}:
+            extra_key = "$BPSPX_%B"
+            if extra_key not in symbols and extra_key not in rows:
+                pass
+
+        cur = snapshot.get(sym, np.nan)
+        prev = prev_snapshot.get(sym, np.nan)
+        delta = cur - prev if pd.notna(cur) and pd.notna(prev) else np.nan
+
+        rows.append(
+            {
+                "Symbol": sym,
+                "Current": None if pd.isna(cur) else round(float(cur), 2),
+                "Prior": None if pd.isna(prev) else round(float(prev), 2),
+                "Delta": None if pd.isna(delta) else round(float(delta), 2),
+                "Target": target_for_symbol(sym, thresholds),
+                "State": verbose_state(sym, cur, prev, thresholds),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# CHARTS
 # ============================================================
 def detect_candle_pattern(row: pd.Series) -> str:
     rng = row["high"] - row["low"]
@@ -934,7 +1069,7 @@ def make_symbol_chart(hist_feat: pd.DataFrame, sym: str, bb_lift: float):
 
 
 # ============================================================
-# LLM PROMPT + API
+# LLM
 # ============================================================
 def build_llm_prompt(
     snapshot: Dict[str, float],
@@ -942,6 +1077,8 @@ def build_llm_prompt(
     thresholds: Dict[str, float],
     upload_history_df: pd.DataFrame,
     weekly_df: pd.DataFrame,
+    core_momentum_df: pd.DataFrame,
+    extended_momentum_df: pd.DataFrame,
 ) -> str:
     stage_num, stage_name = breadth_stage(snapshot, thresholds)
     repair = qwen_repair_trigger(snapshot, thresholds)
@@ -968,6 +1105,7 @@ Rules:
   2. new long entry
   3. leverage long
   4. failed-bounce short probe
+- use the momentum context tables heavily
 - do not invent probabilities; use weighted scenario language
 - be concise but specific
 
@@ -982,28 +1120,11 @@ Current state:
 - Failed-bounce reasons: {failed_reasons}
 - Scenario scores: {scenarios}
 
-Current snapshot:
-- BPSPX: {snapshot.get("$BPSPX", np.nan)}
-- BPSPX %B: {snapshot.get("$BPSPX_%B", np.nan)}
-- SPXA50R: {snapshot.get("$SPXA50R", np.nan)}
-- NYMO: {snapshot.get("$NYMO", np.nan)}
-- NYSI: {snapshot.get("$NYSI", np.nan)}
-- NYAD: {snapshot.get("$NYAD", np.nan)}
-- SPXADP: {snapshot.get("$SPXADP", np.nan)}
-- CPCE: {snapshot.get("$CPCE", np.nan)}
-- NYHL: {snapshot.get("$NYHL", np.nan)}
-- VXX: {snapshot.get("VXX", np.nan)}
-- RSP:SPY: {snapshot.get("RSP:SPY", np.nan)}
-- NYMO Proxy: {snapshot.get("NYMO_PROXY", np.nan)}
+Core momentum context:
+{core_momentum_df.to_json(orient="records", indent=2)}
 
-Prior snapshot:
-- BPSPX: {(prev_snapshot or {}).get("$BPSPX", np.nan)}
-- BPSPX %B: {(prev_snapshot or {}).get("$BPSPX_%B", np.nan)}
-- SPXA50R: {(prev_snapshot or {}).get("$SPXA50R", np.nan)}
-- NYMO: {(prev_snapshot or {}).get("$NYMO", np.nan)}
-- NYSI: {(prev_snapshot or {}).get("$NYSI", np.nan)}
-- VXX: {(prev_snapshot or {}).get("VXX", np.nan)}
-- RSP:SPY: {(prev_snapshot or {}).get("RSP:SPY", np.nan)}
+Extended momentum context:
+{extended_momentum_df.to_json(orient="records", indent=2)}
 
 Recent upload history:
 {json.dumps(recent_uploads, indent=2)}
@@ -1024,23 +1145,13 @@ Return sections:
     return prompt
 
 
-def call_openai_analysis(client: OpenAI, model_name: str, prompt: str) -> str:
-    response = client.responses.create(
-        model=model_name,
-        input=prompt,
-    )
-    return response.output_text
-
-
 # ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
     st.header("Baseline / Uploads")
-
     baseline_file = st.file_uploader("Upload historical baseline CSV", type=["csv"])
     realtime_file = st.file_uploader("Upload new realtime / EOD snapshot CSV", type=["csv"])
-
     upload_tag = st.text_input("Upload tag", value="manual upload")
 
     st.markdown("---")
@@ -1054,11 +1165,12 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Display")
-    show_charts = st.multiselect("Minimal charts", CORE_SYMBOLS, default=DEFAULT_MINIMAL_CHARTS)
+    show_charts = st.multiselect("Minimal charts", ALL_SYMBOLS + ["$BPSPX"], default=DEFAULT_MINIMAL_CHARTS)
 
     st.markdown("---")
-    st.subheader("ChatGPT API")
-    run_llm = st.checkbox("Run ChatGPT analysis", value=False)
+    st.subheader("OpenAI / ChatGPT")
+    st.text_input("Manual API key (optional)", type="password", key="manual_api_key")
+    run_llm = st.checkbox("Run ChatGPT analysis if key exists", value=False)
     show_prompt = st.checkbox("Show prompt", value=False)
 
     st.markdown("---")
@@ -1150,7 +1262,7 @@ else:
 
 
 # ============================================================
-# CALCULATED TABLES
+# CALCULATIONS
 # ============================================================
 stage_num, stage_name = breadth_stage(snapshot, thresholds)
 repair_trigger = qwen_repair_trigger(snapshot, thresholds)
@@ -1162,61 +1274,34 @@ failed_risk, short_probe_ok, failed_reasons = failed_bounce_risk(snapshot, prev_
 recent_uploads_df = latest_upload_rows(5)
 intraday_df = intraday_multi_upload_analysis(recent_uploads_df)
 
-action_rows = [
-    {
-        "Use Case": "Existing long hold",
-        "Status": "YES" if stage_num >= 1 else "CAUTION",
-        "Guidance": "Hold only if bounce is improving and confluence is not deteriorating.",
-    },
-    {
-        "Use Case": "New long entry",
-        "Status": "YES" if repair_trigger and snapshot.get("$BPSPX", np.nan) > thresholds["BPSPX_CONFIRM"] else "NO / EARLY",
-        "Guidance": "Prefer repair trigger + participation confirmation.",
-    },
-    {
-        "Use Case": "Leverage long",
-        "Status": "YES" if repair_trigger and snapshot.get("$BPSPX", np.nan) > thresholds["BPSPX_CONFIRM"] and snapshot.get("$NYSI", np.nan) > thresholds["NYSI_LEVERAGE_OK"] else "NO",
-        "Guidance": "Reserve leverage for broader confirmation.",
-    },
-    {
-        "Use Case": "Short probe",
-        "Status": "ONLY FAILED BOUNCE" if short_probe_ok else "LESS ATTRACTIVE",
-        "Guidance": "Prefer failed bounce / rejection, not fresh panic lows.",
-    },
-]
-actions_df = pd.DataFrame(action_rows)
-
-momentum_rows = []
-for key in ["$BPSPX_%B", "$SPXA50R", "$NYMO", "$NYSI", "$NYAD", "$SPXADP"]:
-    cur = snapshot.get(key, np.nan)
-    prev = prev_snapshot.get(key, np.nan)
-    delta = cur - prev if pd.notna(cur) and pd.notna(prev) else np.nan
-
-    if pd.isna(cur):
-        state = "Missing"
-    elif key == "$BPSPX_%B":
-        state = "Lifted" if cur > thresholds["BPSPX_BB_LIFT"] else "Pinned low"
-    elif key == "$SPXA50R":
-        state = "Repair passed" if cur > thresholds["SPXA50R_REPAIR"] else ("Near repair" if cur >= 25 else "Weak")
-    elif key == "$NYMO":
-        state = "Healthy" if cur > thresholds["NYMO_HEALTHY"] else ("Washout" if cur < thresholds["NYMO_WASHOUT"] else "Negative")
-    elif key == "$NYSI":
-        state = "Positive" if cur > thresholds["NYSI_POSITIVE"] else ("Damaged" if cur < thresholds["NYSI_LEVERAGE_OK"] else "Improving but negative")
-    elif key == "$NYAD":
-        state = "Potential thrust" if cur > thresholds["NYAD_THRUST"] else "No thrust"
-    else:
-        state = "Potential thrust" if cur > thresholds["SPXADP_THRUST"] else "No thrust"
-
-    momentum_rows.append(
+actions_df = pd.DataFrame(
+    [
         {
-            "Indicator": key,
-            "Current": None if pd.isna(cur) else round(float(cur), 2),
-            "Prior": None if pd.isna(prev) else round(float(prev), 2),
-            "Delta": None if pd.isna(delta) else round(float(delta), 2),
-            "State": state,
-        }
-    )
-momentum_df = pd.DataFrame(momentum_rows)
+            "Use Case": "Existing long hold",
+            "Status": "YES" if stage_num >= 1 else "CAUTION",
+            "Guidance": "Hold only if bounce is improving and confluence is not deteriorating.",
+        },
+        {
+            "Use Case": "New long entry",
+            "Status": "YES" if repair_trigger and snapshot.get("$BPSPX", np.nan) > thresholds["BPSPX_CONFIRM"] else "NO / EARLY",
+            "Guidance": "Prefer repair trigger + participation confirmation.",
+        },
+        {
+            "Use Case": "Leverage long",
+            "Status": "YES" if repair_trigger and snapshot.get("$BPSPX", np.nan) > thresholds["BPSPX_CONFIRM"] and snapshot.get("$NYSI", np.nan) > thresholds["NYSI_LEVERAGE_OK"] else "NO",
+            "Guidance": "Reserve leverage for broader confirmation.",
+        },
+        {
+            "Use Case": "Short probe",
+            "Status": "ONLY FAILED BOUNCE" if short_probe_ok else "LESS ATTRACTIVE",
+            "Guidance": "Prefer failed bounce / rejection, not fresh panic lows.",
+        },
+    ]
+)
+
+core_momentum_symbols = ["$BPSPX_%B"] + CORE_SYMBOLS
+core_momentum_df = build_momentum_context_table(core_momentum_symbols, snapshot, prev_snapshot, thresholds)
+extended_momentum_df = build_momentum_context_table(EXTENDED_SYMBOLS, snapshot, prev_snapshot, thresholds)
 
 
 # ============================================================
@@ -1254,35 +1339,35 @@ st.caption("These are weighted scenario scores, not statistical probabilities.")
 
 
 # ============================================================
-# ACTION + MOMENTUM
+# ACTIONS
 # ============================================================
-a1, a2 = st.columns(2)
-
-with a1:
-    st.subheader("Action Dashboard")
-    st.dataframe(actions_df, use_container_width=True, hide_index=True)
-
-with a2:
-    st.subheader("Momentum Context")
-    st.dataframe(momentum_df, use_container_width=True, hide_index=True)
+st.subheader("Action Dashboard")
+st.dataframe(actions_df, use_container_width=True, hide_index=True)
 
 
 # ============================================================
-# FAILED BOUNCE DETAIL
+# MOMENTUM CONTEXT
+# ============================================================
+st.subheader("Momentum Context — Core")
+st.dataframe(core_momentum_df, use_container_width=True, hide_index=True)
+
+st.subheader("Momentum Context — Extended")
+st.dataframe(extended_momentum_df, use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# FAILED BOUNCE
 # ============================================================
 st.subheader("Failed-Bounce Short Framework")
-fb1, fb2 = st.columns(2)
-with fb1:
-    st.metric("Short Probe Eligible", "YES" if short_probe_ok else "NO")
-with fb2:
-    st.metric("Failed-Bounce Risk", failed_risk)
-
+f1, f2 = st.columns(2)
+f1.metric("Short Probe Eligible", "YES" if short_probe_ok else "NO")
+f2.metric("Failed-Bounce Risk", failed_risk)
 if failed_reasons:
     st.write("Drivers: " + "; ".join(failed_reasons))
 
 
 # ============================================================
-# MULTI-UPLOAD / INTRADAY
+# MULTI-UPLOAD
 # ============================================================
 st.subheader("Intraday / Multi-Upload Analysis")
 if intraday_df.empty:
@@ -1317,7 +1402,7 @@ else:
 
 
 # ============================================================
-# MINIMAL CHART PANEL
+# CHARTS
 # ============================================================
 st.subheader("Minimal Chart Panel")
 for sym in show_charts:
@@ -1335,39 +1420,49 @@ for sym in show_charts:
 
 
 # ============================================================
-# CHATGPT API
+# CHATGPT
 # ============================================================
 st.subheader("ChatGPT Interpretation")
 
-prompt = build_llm_prompt(snapshot, prev_snapshot, thresholds, upload_history_df, weekly_df)
+prompt = build_llm_prompt(
+    snapshot,
+    prev_snapshot,
+    thresholds,
+    upload_history_df,
+    weekly_df,
+    core_momentum_df,
+    extended_momentum_df,
+)
 
 if show_prompt:
-    st.text_area("Prompt", prompt, height=260)
+    st.text_area("Prompt", prompt, height=300)
 
-client, api_key, model_name = get_openai_client()
+client, api_key, model_name = get_openai_client_and_model()
+use_live_llm = run_llm and client is not None
 
-if run_llm:
-    if client is None:
-        st.warning("OPENAI_API_KEY not found in Streamlit secrets.")
-    else:
-        try:
-            with st.spinner("Running ChatGPT analysis..."):
-                llm_text = call_openai_analysis(client, model_name, prompt)
-            st.markdown(llm_text)
+if use_live_llm:
+    try:
+        with st.spinner(f"Running ChatGPT analysis with {model_name}..."):
+            llm_text = call_openai_analysis(client, model_name, prompt)
+        st.markdown(llm_text)
 
-            append_jsonl(
-                LLM_HISTORY_PATH,
-                {
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "model": model_name,
-                    "prompt": prompt,
-                    "response": llm_text,
-                },
-            )
-        except Exception as e:
-            st.error(f"OpenAI API call failed: {e}")
+        append_jsonl(
+            LLM_HISTORY_PATH,
+            {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "model": model_name,
+                "prompt": prompt,
+                "response": llm_text,
+            },
+        )
+    except Exception as e:
+        st.error(f"OpenAI API call failed: {e}")
+        st.markdown("### Fallback Rule-Based Interpretation")
+        st.write(build_narrative(snapshot, prev_snapshot, thresholds))
 else:
-    st.info("Enable 'Run ChatGPT analysis' in the sidebar to call the API.")
+    st.markdown("### Rule-Based Interpretation")
+    st.write(build_narrative(snapshot, prev_snapshot, thresholds))
+    st.caption("Live ChatGPT analysis is optional. Add an API key in secrets, env var, or the sidebar field.")
 
 
 # ============================================================
