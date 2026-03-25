@@ -1,53 +1,60 @@
 import io
+import json
 import re
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from openai import OpenAI
 
 
 # ============================================================
 # PAGE
 # ============================================================
-st.set_page_config(page_title="Breadth Engine Dashboard", layout="wide")
-st.title("Breadth Engine Dashboard")
-st.caption("Breadth regime engine: historical + realtime overlay + action map")
+st.set_page_config(page_title="Breadth Engine vNext", layout="wide")
+st.title("Breadth Engine vNext")
+st.caption("Stateful breadth workstation: baseline memory + rolling uploads + weekly + ChatGPT API")
+
+
+# ============================================================
+# STORAGE
+# ============================================================
+APP_DIR = Path("breadth_engine_store")
+APP_DIR.mkdir(exist_ok=True)
+
+BASELINE_PATH = APP_DIR / "baseline_hist.parquet"
+BASELINE_META_PATH = APP_DIR / "baseline_meta.json"
+UPLOAD_HISTORY_PATH = APP_DIR / "upload_history.csv"
+LLM_HISTORY_PATH = APP_DIR / "llm_history.jsonl"
 
 
 # ============================================================
 # THRESHOLDS
 # ============================================================
-THRESHOLDS = {
+DEFAULT_THRESHOLDS = {
     "BPSPX_BB_LIFT": 0.20,
     "SPXA50R_REPAIR": 30.0,
     "BPSPX_CONFIRM": 45.0,
     "NYMO_HEALTHY": -20.0,
     "NYMO_WASHOUT": -80.0,
-    "NYSI_TREND_OK": 0.0,
+    "NYSI_POSITIVE": 0.0,
     "NYSI_LEVERAGE_OK": -50.0,
     "NYAD_THRUST": 1500.0,
     "SPXADP_THRUST": 60.0,
-    "BPSPX_DIR_STRONG": 3.0,
     "CPCE_FEAR": 0.80,
     "NYHL_POSITIVE": 0.0,
+    "FAILED_BOUNCE_VXX_UP": 0.0,
+    "FAILED_BOUNCE_RSP_SPY_DOWN": 0.0,
 }
 
 
 # ============================================================
 # CONSTANTS
 # ============================================================
-OHLC_PATTERN = re.compile(
-    r"(?P<day>Mon|Tue|Wed|Thu|Fri)\s+"
-    r"(?P<date>\d{2}-\d{2}-\d{4})\s+"
-    r"(?P<open>-?\d+(?:\.\d+)?)\s+"
-    r"(?P<high>-?\d+(?:\.\d+)?)\s+"
-    r"(?P<low>-?\d+(?:\.\d+)?)\s+"
-    r"(?P<close>-?\d+(?:\.\d+)?)\s+"
-    r"(?P<volume>-?\d+(?:\.\d+)?)"
-)
-
 CORE_SYMBOLS = [
     "$BPNYA",
     "$BPSPX",
@@ -74,7 +81,17 @@ CORE_SYMBOLS = [
     "XLF:SPY",
 ]
 
-DEFAULT_CHARTS = ["$BPSPX", "$SPXA50R", "$NYMO", "$NYSI", "$NYAD", "$NYHL", "RSP", "VXX"]
+DEFAULT_MINIMAL_CHARTS = ["$BPSPX", "$SPXA50R", "$NYMO", "$NYSI", "RSP"]
+
+OHLC_PATTERN = re.compile(
+    r"(?P<day>Mon|Tue|Wed|Thu|Fri)\s+"
+    r"(?P<date>\d{2}-\d{2}-\d{4})\s+"
+    r"(?P<open>-?\d+(?:\.\d+)?)\s+"
+    r"(?P<high>-?\d+(?:\.\d+)?)\s+"
+    r"(?P<low>-?\d+(?:\.\d+)?)\s+"
+    r"(?P<close>-?\d+(?:\.\d+)?)\s+"
+    r"(?P<volume>-?\d+(?:\.\d+)?)"
+)
 
 
 # ============================================================
@@ -84,15 +101,15 @@ def normalize_symbol(sym: str) -> str:
     return str(sym).strip()
 
 
-def fmt_num(val, digits: int = 2) -> str:
+def fmt_num(val, digits=2) -> str:
     if pd.isna(val):
         return "n/a"
     return f"{float(val):.{digits}f}"
 
 
-def safe_float(val) -> float:
+def safe_float(x) -> float:
     try:
-        return float(val)
+        return float(x)
     except Exception:
         return np.nan
 
@@ -103,15 +120,100 @@ def bool_py(x) -> bool:
     return bool(x)
 
 
-def get_snapshot_val(snapshot: Dict[str, float], key: str) -> float:
-    return snapshot.get(key, np.nan)
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def save_json(path: Path, data):
+    path.write_text(json.dumps(data, indent=2))
+
+
+def append_jsonl(path: Path, row: Dict):
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
 
 
 # ============================================================
-# FILE PARSERS
+# OPENAI
+# ============================================================
+def get_openai_client() -> Tuple[Optional[OpenAI], Optional[str], Optional[str]]:
+    api_key = None
+    model_name = "gpt-5.4"
+
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            api_key = st.secrets["OPENAI_API_KEY"]
+        if "OPENAI_MODEL" in st.secrets:
+            model_name = st.secrets["OPENAI_MODEL"]
+    except Exception:
+        pass
+
+    if not api_key:
+        return None, None, model_name
+
+    try:
+        client = OpenAI(api_key=api_key)
+        return client, api_key, model_name
+    except Exception:
+        return None, api_key, model_name
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+def ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1 / period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1 / period, adjust=False).mean()
+    rs = ma_up / ma_down.replace(0, np.nan)
+    return (100 - (100 / (1 + rs))).fillna(50)
+
+
+def cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
+    tp = (high + low + close) / 3
+    sma = tp.rolling(period).mean()
+    mad = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+    return (tp - sma) / (0.015 * mad.replace(0, np.nan))
+
+
+def true_strength_index(series: pd.Series, long: int = 25, short: int = 13, signal: int = 7):
+    m = series.diff()
+    a = m.abs()
+    m1 = ema(ema(m, long), short)
+    a1 = ema(ema(a, long), short)
+    tsi = 100 * (m1 / a1.replace(0, np.nan))
+    sig = ema(tsi, signal)
+    return tsi, sig
+
+
+def percent_b(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.Series:
+    ma = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    upper = ma + num_std * std
+    lower = ma - num_std * std
+    return (series - lower) / (upper - lower).replace(0, np.nan)
+
+
+def roc(series: pd.Series, period: int = 3) -> pd.Series:
+    return (series / series.shift(period) - 1) * 100
+
+
+# ============================================================
+# PARSERS
 # ============================================================
 @st.cache_data(show_spinner=False)
-def parse_historical_raw_from_bytes(file_bytes: bytes) -> pd.DataFrame:
+def parse_stockcharts_historical_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     raw = pd.read_csv(io.BytesIO(file_bytes), header=None)
     records: List[Dict] = []
 
@@ -140,20 +242,17 @@ def parse_historical_raw_from_bytes(file_bytes: bytes) -> pd.DataFrame:
             )
 
     if not records:
-        raise ValueError(
-            "Historical CSV could not be parsed. Make sure it is the StockCharts-style 1-column export."
-        )
+        raise ValueError("Historical baseline could not be parsed. Use the StockCharts-style historical export.")
 
-    df = pd.DataFrame(records)
-    return df.sort_values(["symbol", "date"]).reset_index(drop=True)
+    return pd.DataFrame(records).sort_values(["symbol", "date"]).reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False)
-def load_realtime_table_from_bytes(file_bytes: bytes) -> pd.DataFrame:
+def parse_realtime_snapshot_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(file_bytes))
 
     if "Symbol" not in df.columns:
-        raise ValueError("Realtime CSV must contain a 'Symbol' column.")
+        raise ValueError("Realtime snapshot must contain a 'Symbol' column.")
 
     df["Symbol"] = df["Symbol"].astype(str).map(normalize_symbol)
 
@@ -167,82 +266,27 @@ def load_realtime_table_from_bytes(file_bytes: bytes) -> pd.DataFrame:
         "Close Price",
     ]
     close_col = next((c for c in close_candidates if c in df.columns), None)
-
     if close_col is None:
-        raise ValueError(
-            "Realtime CSV must contain one of these columns: "
-            + ", ".join(close_candidates)
-        )
+        raise ValueError("Realtime snapshot must contain a close-like column.")
 
     df["Close"] = pd.to_numeric(df[close_col], errors="coerce")
 
-    change_candidates = [
+    pct_candidates = [
         "Daily PctChange(1,Daily Close)",
-        "Pct Change",
         "% Change",
+        "Pct Change",
         "Change %",
         "Daily Change %",
     ]
-    found_change = next((c for c in change_candidates if c in df.columns), None)
-    if found_change is not None:
-        df["PctChange"] = pd.to_numeric(df[found_change], errors="coerce")
-    else:
-        df["PctChange"] = np.nan
+    pct_col = next((c for c in pct_candidates if c in df.columns), None)
+    df["PctChange"] = pd.to_numeric(df[pct_col], errors="coerce") if pct_col else np.nan
 
     return df
 
 
 # ============================================================
-# INDICATORS
+# FEATURE ENGINE
 # ============================================================
-def ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False).mean()
-
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = ma_up / ma_down.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50)
-
-
-def cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
-    tp = (high + low + close) / 3
-    sma = tp.rolling(period).mean()
-    mad = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-    return (tp - sma) / (0.015 * mad.replace(0, np.nan))
-
-
-def true_strength_index(
-    series: pd.Series,
-    long: int = 25,
-    short: int = 13,
-    signal: int = 7,
-) -> Tuple[pd.Series, pd.Series]:
-    m = series.diff()
-    a = m.abs()
-    m1 = ema(ema(m, long), short)
-    a1 = ema(ema(a, long), short)
-    tsi = 100 * (m1 / a1.replace(0, np.nan))
-    sig = ema(tsi, signal)
-    return tsi, sig
-
-
-def percent_b(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.Series:
-    ma = series.rolling(window).mean()
-    std = series.rolling(window).std()
-    upper = ma + num_std * std
-    lower = ma - num_std * std
-    return (series - lower) / (upper - lower).replace(0, np.nan)
-
-
-def roc(series: pd.Series, period: int = 3) -> pd.Series:
-    return (series / series.shift(period) - 1) * 100
-
-
 @st.cache_data(show_spinner=False)
 def add_indicator_features(hist: pd.DataFrame) -> pd.DataFrame:
     frames = []
@@ -271,12 +315,548 @@ def add_indicator_features(hist: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def wide_from_long(hist: pd.DataFrame) -> pd.DataFrame:
-    return hist.pivot(index="date", columns="symbol", values="close").sort_index()
+def get_latest_feature_snapshot(hist_feat: pd.DataFrame) -> Dict[str, float]:
+    snapshot: Dict[str, float] = {}
+    latest_rows = hist_feat.sort_values("date").groupby("symbol", as_index=False).tail(1)
+
+    for _, row in latest_rows.iterrows():
+        sym = row["symbol"]
+        snapshot[sym] = safe_float(row.get("close"))
+        snapshot[f"{sym}_%B"] = safe_float(row.get("pct_b20"))
+        snapshot[f"{sym}_RSI14"] = safe_float(row.get("rsi14"))
+        snapshot[f"{sym}_CCI20"] = safe_float(row.get("cci20"))
+        snapshot[f"{sym}_TSI"] = safe_float(row.get("tsi_fast"))
+
+    return snapshot
+
+
+def get_prior_feature_snapshot(hist_feat: pd.DataFrame) -> Dict[str, float]:
+    snapshot: Dict[str, float] = {}
+    for sym, g in hist_feat.groupby("symbol", sort=False):
+        g = g.sort_values("date")
+        if len(g) < 2:
+            continue
+        row = g.iloc[-2]
+        snapshot[sym] = safe_float(row.get("close"))
+        snapshot[f"{sym}_%B"] = safe_float(row.get("pct_b20"))
+        snapshot[f"{sym}_RSI14"] = safe_float(row.get("rsi14"))
+        snapshot[f"{sym}_CCI20"] = safe_float(row.get("cci20"))
+        snapshot[f"{sym}_TSI"] = safe_float(row.get("tsi_fast"))
+    return snapshot
 
 
 # ============================================================
-# PATTERN DETECTION
+# REGIME LOGIC
+# ============================================================
+def score_nyad(val: float, thresholds: Dict[str, float]) -> int:
+    if pd.isna(val):
+        return 0
+    if val > thresholds["NYAD_THRUST"]:
+        return 2
+    if val > 300:
+        return 1
+    if val < -1500:
+        return -2
+    if val < -300:
+        return -1
+    return 0
+
+
+def score_spxadp(val: float, thresholds: Dict[str, float]) -> int:
+    if pd.isna(val):
+        return 0
+    if val > thresholds["SPXADP_THRUST"]:
+        return 2
+    if val > 20:
+        return 1
+    if val < -60:
+        return -2
+    if val < -20:
+        return -1
+    return 0
+
+
+def derive_bpspx_direction(latest_close: float, prior_close: float) -> int:
+    if pd.isna(latest_close) or pd.isna(prior_close):
+        return 0
+    diff = latest_close - prior_close
+    if diff >= 3:
+        return 2
+    if diff > 0:
+        return 1
+    if diff <= -3:
+        return -2
+    if diff < 0:
+        return -1
+    return 0
+
+
+def compute_nymo_proxy(snapshot: Dict[str, float], thresholds: Dict[str, float], prev_snapshot: Optional[Dict[str, float]]) -> float:
+    nyad = snapshot.get("$NYAD", np.nan)
+    spxadp = snapshot.get("$SPXADP", np.nan)
+    bpspx = snapshot.get("$BPSPX", np.nan)
+    prev_bpspx = (prev_snapshot or {}).get("$BPSPX", np.nan)
+    bpspx_dir = derive_bpspx_direction(bpspx, prev_bpspx)
+    return 0.5 * score_nyad(nyad, thresholds) + 0.3 * score_spxadp(spxadp, thresholds) + 0.2 * bpspx_dir
+
+
+def qwen_repair_trigger(snapshot: Dict[str, float], thresholds: Dict[str, float]) -> bool:
+    bpspx_bb = snapshot.get("$BPSPX_%B", np.nan)
+    spxa50r = snapshot.get("$SPXA50R", np.nan)
+    return bool(
+        pd.notna(bpspx_bb)
+        and pd.notna(spxa50r)
+        and bpspx_bb > thresholds["BPSPX_BB_LIFT"]
+        and spxa50r > thresholds["SPXA50R_REPAIR"]
+    )
+
+
+def breadth_stage(snapshot: Dict[str, float], thresholds: Dict[str, float]) -> Tuple[int, str]:
+    bpspx_bb = snapshot.get("$BPSPX_%B", np.nan)
+    spxa50r = snapshot.get("$SPXA50R", np.nan)
+    bpspx = snapshot.get("$BPSPX", np.nan)
+    nysi = snapshot.get("$NYSI", np.nan)
+
+    if pd.isna(bpspx_bb):
+        return 0, "Unknown"
+
+    if bpspx_bb < thresholds["BPSPX_BB_LIFT"]:
+        return 0, "Washout / lower-band pressure"
+    if bpspx_bb >= thresholds["BPSPX_BB_LIFT"] and (pd.isna(spxa50r) or spxa50r <= thresholds["SPXA50R_REPAIR"]):
+        return 1, "Bounce starting"
+    if (
+        bpspx_bb > thresholds["BPSPX_BB_LIFT"]
+        and pd.notna(spxa50r)
+        and spxa50r > thresholds["SPXA50R_REPAIR"]
+        and (pd.isna(bpspx) or bpspx <= thresholds["BPSPX_CONFIRM"])
+    ):
+        return 2, "Breadth repair"
+    if (
+        bpspx_bb > thresholds["BPSPX_BB_LIFT"]
+        and pd.notna(spxa50r)
+        and spxa50r > thresholds["SPXA50R_REPAIR"]
+        and pd.notna(bpspx)
+        and bpspx > thresholds["BPSPX_CONFIRM"]
+        and (pd.isna(nysi) or nysi <= thresholds["NYSI_POSITIVE"])
+    ):
+        return 3, "Participation confirmation"
+    if (
+        bpspx_bb > thresholds["BPSPX_BB_LIFT"]
+        and pd.notna(spxa50r)
+        and spxa50r > thresholds["SPXA50R_REPAIR"]
+        and pd.notna(bpspx)
+        and bpspx > thresholds["BPSPX_CONFIRM"]
+        and pd.notna(nysi)
+        and nysi > thresholds["NYSI_POSITIVE"]
+    ):
+        return 4, "Trend durability / healthier regime"
+
+    return 0, "Unknown"
+
+
+def bounce_quality(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str, float]], thresholds: Dict[str, float]) -> Tuple[int, List[str]]:
+    score = 0
+    notes: List[str] = []
+
+    bpspx = snapshot.get("$BPSPX", np.nan)
+    bpspx_bb = snapshot.get("$BPSPX_%B", np.nan)
+    spxa50r = snapshot.get("$SPXA50R", np.nan)
+    nyad = snapshot.get("$NYAD", np.nan)
+    spxadp = snapshot.get("$SPXADP", np.nan)
+    cpce = snapshot.get("$CPCE", np.nan)
+    vxx = snapshot.get("VXX", np.nan)
+    rsp_spy = snapshot.get("RSP:SPY", np.nan)
+
+    if pd.notna(bpspx_bb):
+        if bpspx_bb > thresholds["BPSPX_BB_LIFT"]:
+            score += 1
+            notes.append("BPSPX %B lifted")
+        else:
+            notes.append("BPSPX %B pinned low")
+
+    if pd.notna(spxa50r):
+        if spxa50r > thresholds["SPXA50R_REPAIR"]:
+            score += 2
+            notes.append("SPXA50R > 30")
+        elif spxa50r >= 25:
+            score += 1
+            notes.append("SPXA50R improving")
+
+    if pd.notna(bpspx):
+        if bpspx > thresholds["BPSPX_CONFIRM"]:
+            score += 2
+            notes.append("BPSPX > 45")
+        elif bpspx >= 40:
+            score += 1
+            notes.append("BPSPX improving")
+
+    if pd.notna(nyad) and pd.notna(spxadp):
+        if nyad > thresholds["NYAD_THRUST"] and spxadp > thresholds["SPXADP_THRUST"]:
+            score += 2
+            notes.append("Breadth thrust")
+        elif nyad > 500 or spxadp > 20:
+            score += 1
+            notes.append("Moderate thrust")
+
+    if pd.notna(cpce) and cpce >= thresholds["CPCE_FEAR"]:
+        score += 1
+        notes.append("CPCE fear support")
+
+    if prev_snapshot:
+        prev_vxx = prev_snapshot.get("VXX", np.nan)
+        if pd.notna(vxx) and pd.notna(prev_vxx) and vxx < prev_vxx:
+            score += 1
+            notes.append("VXX easing")
+
+        prev_rsp_spy = prev_snapshot.get("RSP:SPY", np.nan)
+        if pd.notna(rsp_spy) and pd.notna(prev_rsp_spy) and rsp_spy >= prev_rsp_spy:
+            score += 1
+            notes.append("Equal-weight not lagging")
+
+    return min(score, 9), notes
+
+
+def breadth_confluence_score(snapshot: Dict[str, float], thresholds: Dict[str, float]) -> float:
+    score = 0.0
+
+    bpspx_bb = snapshot.get("$BPSPX_%B", np.nan)
+    spxa50r = snapshot.get("$SPXA50R", np.nan)
+    bpspx = snapshot.get("$BPSPX", np.nan)
+    nymo = snapshot.get("$NYMO", np.nan)
+    nysi = snapshot.get("$NYSI", np.nan)
+    nyad = snapshot.get("$NYAD", np.nan)
+    spxadp = snapshot.get("$SPXADP", np.nan)
+    cpce = snapshot.get("$CPCE", np.nan)
+    nyhl = snapshot.get("$NYHL", np.nan)
+
+    if pd.notna(bpspx_bb):
+        score += 1.0 if bpspx_bb > thresholds["BPSPX_BB_LIFT"] else -1.0
+    if pd.notna(spxa50r):
+        score += 1.5 if spxa50r > thresholds["SPXA50R_REPAIR"] else (-0.5 if spxa50r >= 25 else -1.5)
+    if pd.notna(bpspx):
+        score += 1.5 if bpspx > thresholds["BPSPX_CONFIRM"] else (-0.5 if bpspx >= 40 else -1.5)
+    if pd.notna(nymo):
+        score += 1.0 if nymo > thresholds["NYMO_HEALTHY"] else (-1.0 if nymo < -50 else 0.0)
+    if pd.notna(nysi):
+        score += 1.5 if nysi > thresholds["NYSI_POSITIVE"] else (-1.5 if nysi < thresholds["NYSI_LEVERAGE_OK"] else -0.5)
+    if pd.notna(nyad) and pd.notna(spxadp):
+        score += 1.5 if nyad > thresholds["NYAD_THRUST"] and spxadp > thresholds["SPXADP_THRUST"] else 0.0
+    if pd.notna(cpce):
+        score += 0.5 if cpce >= thresholds["CPCE_FEAR"] else 0.0
+    if pd.notna(nyhl):
+        score += 1.0 if nyhl > thresholds["NYHL_POSITIVE"] else -0.5
+
+    return max(-10.0, min(10.0, round(score, 2)))
+
+
+def scenario_scores(snapshot: Dict[str, float], thresholds: Dict[str, float]) -> Dict[str, int]:
+    bearish_cont = 0
+    oversold_bounce = 0
+    true_repair = 0
+
+    bpspx = snapshot.get("$BPSPX", np.nan)
+    bpspx_bb = snapshot.get("$BPSPX_%B", np.nan)
+    spxa50r = snapshot.get("$SPXA50R", np.nan)
+    nymo = snapshot.get("$NYMO", np.nan)
+    nysi = snapshot.get("$NYSI", np.nan)
+    nyad = snapshot.get("$NYAD", np.nan)
+    spxadp = snapshot.get("$SPXADP", np.nan)
+    cpce = snapshot.get("$CPCE", np.nan)
+
+    if pd.notna(nysi) and nysi < thresholds["NYSI_LEVERAGE_OK"]:
+        bearish_cont += 3
+    if pd.notna(nymo) and nymo < thresholds["NYMO_HEALTHY"]:
+        bearish_cont += 2
+    if pd.notna(bpspx) and bpspx < thresholds["BPSPX_CONFIRM"]:
+        bearish_cont += 2
+    if pd.notna(spxa50r) and spxa50r < thresholds["SPXA50R_REPAIR"]:
+        bearish_cont += 2
+
+    if pd.notna(cpce) and cpce >= thresholds["CPCE_FEAR"]:
+        oversold_bounce += 2
+    if pd.notna(bpspx_bb) and bpspx_bb < thresholds["BPSPX_BB_LIFT"]:
+        oversold_bounce += 2
+    if pd.notna(nymo) and nymo < 0:
+        oversold_bounce += 1
+    if pd.notna(spxa50r) and spxa50r >= 25:
+        oversold_bounce += 1
+
+    if qwen_repair_trigger(snapshot, thresholds):
+        true_repair += 3
+    if pd.notna(bpspx) and bpspx > thresholds["BPSPX_CONFIRM"]:
+        true_repair += 2
+    if pd.notna(nymo) and nymo > thresholds["NYMO_HEALTHY"]:
+        true_repair += 1
+    if pd.notna(nysi) and nysi > thresholds["NYSI_POSITIVE"]:
+        true_repair += 2
+    if pd.notna(nyad) and pd.notna(spxadp) and nyad > thresholds["NYAD_THRUST"] and spxadp > thresholds["SPXADP_THRUST"]:
+        true_repair += 2
+
+    return {
+        "Bearish continuation": bearish_cont,
+        "Oversold bounce": oversold_bounce,
+        "True repair": true_repair,
+    }
+
+
+def failed_bounce_risk(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str, float]], thresholds: Dict[str, float]) -> Tuple[str, bool, List[str]]:
+    reasons = []
+    risk_points = 0
+
+    stage_num, _ = breadth_stage(snapshot, thresholds)
+    bpspx_bb = snapshot.get("$BPSPX_%B", np.nan)
+    spxa50r = snapshot.get("$SPXA50R", np.nan)
+    nymo = snapshot.get("$NYMO", np.nan)
+    nysi = snapshot.get("$NYSI", np.nan)
+    rsp_spy = snapshot.get("RSP:SPY", np.nan)
+    vxx = snapshot.get("VXX", np.nan)
+
+    prev_bpspx_bb = (prev_snapshot or {}).get("$BPSPX_%B", np.nan)
+    prev_spxa50r = (prev_snapshot or {}).get("$SPXA50R", np.nan)
+    prev_rsp_spy = (prev_snapshot or {}).get("RSP:SPY", np.nan)
+    prev_vxx = (prev_snapshot or {}).get("VXX", np.nan)
+
+    if stage_num <= 1:
+        risk_points += 1
+        reasons.append("Bounce still early-stage")
+
+    if pd.notna(bpspx_bb) and bpspx_bb < thresholds["BPSPX_BB_LIFT"]:
+        risk_points += 2
+        reasons.append("BPSPX %B below repair lift")
+
+    if pd.notna(prev_bpspx_bb) and pd.notna(bpspx_bb) and bpspx_bb < prev_bpspx_bb:
+        risk_points += 1
+        reasons.append("BPSPX %B deteriorating")
+
+    if pd.notna(spxa50r) and spxa50r < thresholds["SPXA50R_REPAIR"]:
+        risk_points += 1
+        reasons.append("SPXA50R below repair threshold")
+
+    if pd.notna(prev_spxa50r) and pd.notna(spxa50r) and spxa50r < prev_spxa50r:
+        risk_points += 1
+        reasons.append("SPXA50R weakening")
+
+    if pd.notna(nymo) and nymo < thresholds["NYMO_HEALTHY"]:
+        risk_points += 1
+        reasons.append("NYMO still negative")
+
+    if pd.notna(nysi) and nysi < thresholds["NYSI_LEVERAGE_OK"]:
+        risk_points += 2
+        reasons.append("NYSI still structurally damaged")
+
+    if pd.notna(prev_rsp_spy) and pd.notna(rsp_spy) and rsp_spy < prev_rsp_spy:
+        risk_points += 1
+        reasons.append("RSP:SPY weakening")
+
+    if pd.notna(prev_vxx) and pd.notna(vxx) and vxx > prev_vxx:
+        risk_points += 1
+        reasons.append("VXX rising")
+
+    if risk_points >= 7:
+        return "HIGH", True, reasons
+    if risk_points >= 4:
+        return "MED", True, reasons
+    return "LOW", False, reasons
+
+
+def build_narrative(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str, float]], thresholds: Dict[str, float]) -> str:
+    stage_num, stage_name = breadth_stage(snapshot, thresholds)
+    repair = qwen_repair_trigger(snapshot, thresholds)
+    confluence = breadth_confluence_score(snapshot, thresholds)
+    bounce_score, notes = bounce_quality(snapshot, prev_snapshot, thresholds)
+    failed_risk, short_probe_ok, failed_reasons = failed_bounce_risk(snapshot, prev_snapshot, thresholds)
+
+    parts = [
+        f"Stage {stage_num}: {stage_name}.",
+        f"Breadth Confluence Score: {confluence}/10.",
+        f"Bounce Quality Score: {bounce_score}/9.",
+        f"Failed-bounce risk: {failed_risk}.",
+    ]
+
+    bpspx_bb = snapshot.get("$BPSPX_%B", np.nan)
+    if pd.notna(bpspx_bb):
+        parts.append(f"BPSPX Bollinger %B is {bpspx_bb:.2f}.")
+
+    if repair:
+        parts.append("Qwen repair trigger is active.")
+    else:
+        parts.append("Qwen repair trigger is not active.")
+
+    if short_probe_ok and failed_risk in {"MED", "HIGH"}:
+        parts.append("Short probe is only attractive on failed-bounce conditions, not fresh panic lows.")
+
+    bpspx = snapshot.get("$BPSPX", np.nan)
+    spxa50r = snapshot.get("$SPXA50R", np.nan)
+    nymo = snapshot.get("$NYMO", np.nan)
+    nysi = snapshot.get("$NYSI", np.nan)
+
+    if pd.notna(bpspx) and pd.notna(spxa50r):
+        parts.append(f"BPSPX {bpspx:.2f} and SPXA50R {spxa50r:.2f} define participation and depth.")
+    if pd.notna(nymo):
+        parts.append(f"NYMO is {nymo:.2f}.")
+    if pd.notna(nysi):
+        parts.append(f"NYSI is {nysi:.2f}.")
+
+    if notes:
+        parts.append("Key supports / drags: " + "; ".join(notes) + ".")
+
+    if failed_reasons:
+        parts.append("Failed-bounce drivers: " + "; ".join(failed_reasons) + ".")
+
+    return " ".join(parts)
+
+
+# ============================================================
+# WEEKLY ANALYSIS
+# ============================================================
+def weekly_analysis(hist_feat: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    focus = ["$BPSPX", "$SPXA50R", "$NYMO", "$NYSI", "RSP"]
+
+    for sym in focus:
+        g = hist_feat[hist_feat["symbol"] == sym].sort_values("date").copy()
+        if g.empty:
+            continue
+
+        weekly = (
+            g.set_index("date")[["close"]]
+            .resample("W-FRI")
+            .last()
+            .dropna()
+            .rename(columns={"close": "weekly_close"})
+        )
+        if len(weekly) < 3:
+            continue
+
+        weekly["w1"] = weekly["weekly_close"].diff(1)
+        weekly["w4"] = weekly["weekly_close"].diff(4)
+        latest = weekly.iloc[-1]
+
+        if pd.isna(latest["w4"]):
+            trend = "insufficient"
+        elif latest["w4"] > 0:
+            trend = "improving"
+        elif latest["w4"] < 0:
+            trend = "deteriorating"
+        else:
+            trend = "flat"
+
+        rows.append(
+            {
+                "Symbol": sym,
+                "Weekly Close": round(float(latest["weekly_close"]), 2),
+                "1W Change": None if pd.isna(latest["w1"]) else round(float(latest["w1"]), 2),
+                "4W Change": None if pd.isna(latest["w4"]) else round(float(latest["w4"]), 2),
+                "Weekly Trend": trend,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# UPLOAD HISTORY
+# ============================================================
+def load_upload_history() -> pd.DataFrame:
+    if not UPLOAD_HISTORY_PATH.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(UPLOAD_HISTORY_PATH)
+    except Exception:
+        return pd.DataFrame()
+
+
+def append_upload_history(row: Dict):
+    hist = load_upload_history()
+    hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+    hist.to_csv(UPLOAD_HISTORY_PATH, index=False)
+
+
+def latest_upload_rows(n: int = 5) -> pd.DataFrame:
+    hist = load_upload_history()
+    if hist.empty:
+        return hist
+    if "upload_ts" in hist.columns:
+        hist = hist.sort_values("upload_ts")
+    return hist.tail(n).reset_index(drop=True)
+
+
+def build_upload_summary(snapshot: Dict[str, float], thresholds: Dict[str, float], tag: str, prev_snapshot: Optional[Dict[str, float]]) -> Dict:
+    stage_num, stage_name = breadth_stage(snapshot, thresholds)
+    bounce_score, _ = bounce_quality(snapshot, prev_snapshot, thresholds)
+    confluence = breadth_confluence_score(snapshot, thresholds)
+    scenarios = scenario_scores(snapshot, thresholds)
+    failed_risk, short_probe_ok, _ = failed_bounce_risk(snapshot, prev_snapshot, thresholds)
+
+    return {
+        "upload_ts": datetime.now().isoformat(timespec="seconds"),
+        "tag": tag,
+        "BPSPX": snapshot.get("$BPSPX", np.nan),
+        "BPSPX_%B": snapshot.get("$BPSPX_%B", np.nan),
+        "SPXA50R": snapshot.get("$SPXA50R", np.nan),
+        "NYMO": snapshot.get("$NYMO", np.nan),
+        "NYSI": snapshot.get("$NYSI", np.nan),
+        "NYAD": snapshot.get("$NYAD", np.nan),
+        "SPXADP": snapshot.get("$SPXADP", np.nan),
+        "CPCE": snapshot.get("$CPCE", np.nan),
+        "NYHL": snapshot.get("$NYHL", np.nan),
+        "VXX": snapshot.get("VXX", np.nan),
+        "RSP:SPY": snapshot.get("RSP:SPY", np.nan),
+        "NYMO_PROXY": snapshot.get("NYMO_PROXY", np.nan),
+        "ConfluenceScore": confluence,
+        "BounceScore": bounce_score,
+        "Stage": stage_num,
+        "StageName": stage_name,
+        "RepairTrigger": qwen_repair_trigger(snapshot, thresholds),
+        "FailedBounceRisk": failed_risk,
+        "ShortProbeEligible": short_probe_ok,
+        "BearishContinuation": scenarios["Bearish continuation"],
+        "OversoldBounce": scenarios["Oversold bounce"],
+        "TrueRepair": scenarios["True repair"],
+    }
+
+
+def intraday_multi_upload_analysis(history_df: pd.DataFrame) -> pd.DataFrame:
+    if history_df.empty or len(history_df) < 2:
+        return pd.DataFrame()
+
+    cols = ["BPSPX", "BPSPX_%B", "SPXA50R", "NYMO", "NYSI", "BounceScore", "ConfluenceScore"]
+    rows = []
+
+    last = history_df.iloc[-1]
+    prev = history_df.iloc[-2]
+
+    for col in cols:
+        if col not in history_df.columns:
+            continue
+        cur = safe_float(last[col])
+        old = safe_float(prev[col])
+        delta = cur - old if pd.notna(cur) and pd.notna(old) else np.nan
+
+        if pd.isna(delta):
+            trend = "n/a"
+        elif delta > 0:
+            trend = "improving"
+        elif delta < 0:
+            trend = "worsening"
+        else:
+            trend = "flat"
+
+        rows.append(
+            {
+                "Metric": col,
+                "Current": None if pd.isna(cur) else round(float(cur), 2),
+                "Prior Upload": None if pd.isna(old) else round(float(old), 2),
+                "Delta": None if pd.isna(delta) else round(float(delta), 2),
+                "Direction": trend,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# CHART HELPERS
 # ============================================================
 def detect_candle_pattern(row: pd.Series) -> str:
     rng = row["high"] - row["low"]
@@ -300,944 +880,520 @@ def detect_candle_pattern(row: pd.Series) -> str:
     return "neutral"
 
 
-def detect_bear_kiss(g: pd.DataFrame, ma_col: str = "ma50") -> pd.Series:
-    ma = g[ma_col]
-    return ((g["high"] >= ma * 0.995) & (g["close"] < ma)).fillna(False)
+def make_symbol_chart(hist_feat: pd.DataFrame, sym: str, bb_lift: float):
+    g = hist_feat[hist_feat["symbol"] == sym].sort_values("date").copy()
+    if g.empty:
+        return None, None, None
 
+    g["candle_pattern"] = g.apply(detect_candle_pattern, axis=1)
+    last = g.iloc[-1]
 
-def detect_bull_kiss(g: pd.DataFrame, ma_col: str = "ma50") -> pd.Series:
-    ma = g[ma_col]
-    return ((g["low"] <= ma * 1.005) & (g["close"] > ma)).fillna(False)
-
-
-# ============================================================
-# CORE BREADTH LOGIC
-# ============================================================
-def score_nyad(val: float) -> int:
-    if pd.isna(val):
-        return 0
-    if val > THRESHOLDS["NYAD_THRUST"]:
-        return 2
-    if val > 300:
-        return 1
-    if val < -1500:
-        return -2
-    if val < -300:
-        return -1
-    return 0
-
-
-def score_spxadp(val: float) -> int:
-    if pd.isna(val):
-        return 0
-    if val > THRESHOLDS["SPXADP_THRUST"]:
-        return 2
-    if val > 20:
-        return 1
-    if val < -60:
-        return -2
-    if val < -20:
-        return -1
-    return 0
-
-
-def derive_bpspx_direction(latest_close: float, prior_close: float) -> int:
-    if pd.isna(latest_close) or pd.isna(prior_close):
-        return 0
-    diff = latest_close - prior_close
-    if diff >= THRESHOLDS["BPSPX_DIR_STRONG"]:
-        return 2
-    if diff > 0:
-        return 1
-    if diff <= -THRESHOLDS["BPSPX_DIR_STRONG"]:
-        return -2
-    if diff < 0:
-        return -1
-    return 0
-
-
-def compute_nymo_proxy(nyad: float, spxadp: float, bpspx_dir: int = 0) -> float:
-    return 0.5 * score_nyad(nyad) + 0.3 * score_spxadp(spxadp) + 0.2 * bpspx_dir
-
-
-def qwen_repair_trigger(snapshot: Dict[str, float]) -> bool:
-    bpspx_bb = get_snapshot_val(snapshot, "$BPSPX_%B")
-    spxa50r = get_snapshot_val(snapshot, "$SPXA50R")
-    return bool(
-        pd.notna(bpspx_bb)
-        and pd.notna(spxa50r)
-        and bpspx_bb > THRESHOLDS["BPSPX_BB_LIFT"]
-        and spxa50r > THRESHOLDS["SPXA50R_REPAIR"]
+    price_fig = go.Figure()
+    price_fig.add_trace(
+        go.Candlestick(
+            x=g["date"],
+            open=g["open"],
+            high=g["high"],
+            low=g["low"],
+            close=g["close"],
+            name=sym,
+        )
     )
+    if g["ma20"].notna().any():
+        price_fig.add_trace(go.Scatter(x=g["date"], y=g["ma20"], name="MA20"))
+    if g["ma50"].notna().any():
+        price_fig.add_trace(go.Scatter(x=g["date"], y=g["ma50"], name="MA50"))
+    if g["ma200"].notna().any():
+        price_fig.add_trace(go.Scatter(x=g["date"], y=g["ma200"], name="MA200"))
+    price_fig.update_layout(height=300, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=15, b=10))
 
+    osc_fig = go.Figure()
+    osc_fig.add_trace(go.Scatter(x=g["date"], y=g["pct_b20"], name="Bollinger %B(20,2)"))
+    osc_fig.add_trace(go.Scatter(x=g["date"], y=g["rsi14"], name="RSI14", visible="legendonly"))
+    osc_fig.add_trace(go.Scatter(x=g["date"], y=g["cci20"], name="CCI20", visible="legendonly"))
+    osc_fig.add_trace(go.Scatter(x=g["date"], y=g["tsi_fast"], name="TSI(4,2,4)", visible="legendonly"))
+    osc_fig.add_hline(y=1.0, line_dash="dash")
+    osc_fig.add_hline(y=0.5, line_dash="dot")
+    osc_fig.add_hline(y=bb_lift, line_dash="dot", annotation_text=f"%B {bb_lift:.2f}")
+    osc_fig.add_hline(y=0.0, line_dash="dash")
+    osc_fig.update_layout(height=240, margin=dict(l=10, r=10, t=15, b=10))
 
-def breadth_stage(snapshot: Dict[str, float]) -> Tuple[int, str]:
-    bpspx_bb = get_snapshot_val(snapshot, "$BPSPX_%B")
-    spxa50r = get_snapshot_val(snapshot, "$SPXA50R")
-    bpspx = get_snapshot_val(snapshot, "$BPSPX")
-    nysi = get_snapshot_val(snapshot, "$NYSI")
-
-    if pd.isna(bpspx_bb):
-        return 0, "Unknown"
-
-    if bpspx_bb < THRESHOLDS["BPSPX_BB_LIFT"]:
-        return 0, "Washout / lower-band pressure"
-    if bpspx_bb >= THRESHOLDS["BPSPX_BB_LIFT"] and (pd.isna(spxa50r) or spxa50r <= THRESHOLDS["SPXA50R_REPAIR"]):
-        return 1, "Bounce starting"
-    if (
-        bpspx_bb > THRESHOLDS["BPSPX_BB_LIFT"]
-        and pd.notna(spxa50r)
-        and spxa50r > THRESHOLDS["SPXA50R_REPAIR"]
-        and (pd.isna(bpspx) or bpspx <= THRESHOLDS["BPSPX_CONFIRM"])
-    ):
-        return 2, "Breadth repair"
-    if (
-        bpspx_bb > THRESHOLDS["BPSPX_BB_LIFT"]
-        and pd.notna(spxa50r)
-        and spxa50r > THRESHOLDS["SPXA50R_REPAIR"]
-        and pd.notna(bpspx)
-        and bpspx > THRESHOLDS["BPSPX_CONFIRM"]
-        and (pd.isna(nysi) or nysi <= THRESHOLDS["NYSI_TREND_OK"])
-    ):
-        return 3, "Participation confirmation"
-    if (
-        bpspx_bb > THRESHOLDS["BPSPX_BB_LIFT"]
-        and pd.notna(spxa50r)
-        and spxa50r > THRESHOLDS["SPXA50R_REPAIR"]
-        and pd.notna(bpspx)
-        and bpspx > THRESHOLDS["BPSPX_CONFIRM"]
-        and pd.notna(nysi)
-        and nysi > THRESHOLDS["NYSI_TREND_OK"]
-    ):
-        return 4, "Trend durability / healthier regime"
-
-    return 0, "Unknown"
-
-
-def classify_market_state(snapshot: Dict[str, float]) -> str:
-    bpspx = get_snapshot_val(snapshot, "$BPSPX")
-    spxa50r = get_snapshot_val(snapshot, "$SPXA50R")
-    nymo = get_snapshot_val(snapshot, "$NYMO")
-    proxy = get_snapshot_val(snapshot, "NYMO_PROXY")
-    bpspx_bb = get_snapshot_val(snapshot, "$BPSPX_%B")
-
-    if pd.notna(nymo) and nymo < THRESHOLDS["NYMO_WASHOUT"]:
-        return "capitulation washout"
-    if pd.notna(bpspx_bb) and bpspx_bb < THRESHOLDS["BPSPX_BB_LIFT"] and pd.notna(bpspx) and bpspx < THRESHOLDS["BPSPX_CONFIRM"]:
-        return "oversold / lower-band pressure"
-    if qwen_repair_trigger(snapshot) and pd.notna(bpspx) and bpspx < THRESHOLDS["BPSPX_CONFIRM"]:
-        return "early breadth repair"
-    if pd.notna(proxy) and proxy >= 1.5 and pd.notna(bpspx) and bpspx < THRESHOLDS["BPSPX_CONFIRM"]:
-        return "breadth thrust / early repair"
-    if (
-        pd.notna(bpspx)
-        and pd.notna(spxa50r)
-        and bpspx >= THRESHOLDS["BPSPX_CONFIRM"]
-        and spxa50r >= THRESHOLDS["SPXA50R_REPAIR"]
-        and (pd.isna(nymo) or nymo > THRESHOLDS["NYMO_HEALTHY"])
-    ):
-        return "confirmed trend repair"
-    if (
-        pd.notna(bpspx)
-        and pd.notna(spxa50r)
-        and bpspx < THRESHOLDS["BPSPX_CONFIRM"]
-        and spxa50r < THRESHOLDS["SPXA50R_REPAIR"]
-    ):
-        return "bearish bounce / incomplete repair"
-    return "repair phase"
-
-
-def bounce_quality(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str, float]] = None):
-    notes = []
-    score = 0
-
-    bpspx = get_snapshot_val(snapshot, "$BPSPX")
-    spxa50r = get_snapshot_val(snapshot, "$SPXA50R")
-    nyad = get_snapshot_val(snapshot, "$NYAD")
-    spxadp = get_snapshot_val(snapshot, "$SPXADP")
-    vxx = get_snapshot_val(snapshot, "VXX")
-    rsp_spy = get_snapshot_val(snapshot, "RSP:SPY")
-    bpspx_bb = get_snapshot_val(snapshot, "$BPSPX_%B")
-    cpce = get_snapshot_val(snapshot, "$CPCE")
-
-    if pd.notna(bpspx_bb):
-        if bpspx_bb > THRESHOLDS["BPSPX_BB_LIFT"]:
-            score += 1
-            notes.append("BPSPX Bollinger %B > 0.20")
-        else:
-            notes.append("BPSPX Bollinger %B still pinned low")
-
-    if pd.notna(bpspx):
-        if bpspx >= THRESHOLDS["BPSPX_CONFIRM"]:
-            score += 2
-            notes.append("Participation >45")
-        elif bpspx >= 40:
-            score += 1
-            notes.append("Participation improving")
-
-    if pd.notna(spxa50r):
-        if spxa50r > THRESHOLDS["SPXA50R_REPAIR"]:
-            score += 2
-            notes.append("SPXA50R >30")
-        elif spxa50r >= 25:
-            score += 1
-            notes.append("Depth improving")
-
-    if pd.notna(nyad) and pd.notna(spxadp):
-        if nyad > THRESHOLDS["NYAD_THRUST"] and spxadp > THRESHOLDS["SPXADP_THRUST"]:
-            score += 2
-            notes.append("Strong breadth thrust")
-        elif nyad > 500 or spxadp > 20:
-            score += 1
-            notes.append("Moderate thrust")
-
-    if pd.notna(cpce) and cpce >= THRESHOLDS["CPCE_FEAR"]:
-        score += 1
-        notes.append("CPCE fear support")
-
-    if prev_snapshot and pd.notna(vxx):
-        prev_vxx = prev_snapshot.get("VXX", np.nan)
-        if pd.notna(prev_vxx) and vxx < prev_vxx:
-            score += 1
-            notes.append("Volatility easing")
-
-    if prev_snapshot and pd.notna(rsp_spy):
-        prev_ratio = prev_snapshot.get("RSP:SPY", np.nan)
-        if pd.notna(prev_ratio) and rsp_spy >= prev_ratio:
-            score += 1
-            notes.append("Equal-weight not lagging")
-
-    return min(score, 9), notes
-
-
-def scenario_scores(snapshot: Dict[str, float]) -> Dict[str, int]:
-    bpspx = get_snapshot_val(snapshot, "$BPSPX")
-    bpspx_bb = get_snapshot_val(snapshot, "$BPSPX_%B")
-    spxa50r = get_snapshot_val(snapshot, "$SPXA50R")
-    nymo = get_snapshot_val(snapshot, "$NYMO")
-    nysi = get_snapshot_val(snapshot, "$NYSI")
-    nyad = get_snapshot_val(snapshot, "$NYAD")
-    spxadp = get_snapshot_val(snapshot, "$SPXADP")
-    cpce = get_snapshot_val(snapshot, "$CPCE")
-
-    bearish_cont = 0
-    oversold_bounce = 0
-    true_repair = 0
-
-    if pd.notna(nysi) and nysi < THRESHOLDS["NYSI_LEVERAGE_OK"]:
-        bearish_cont += 3
-    if pd.notna(nymo) and nymo < THRESHOLDS["NYMO_HEALTHY"]:
-        bearish_cont += 2
-    if pd.notna(bpspx) and bpspx < THRESHOLDS["BPSPX_CONFIRM"]:
-        bearish_cont += 2
-    if pd.notna(spxa50r) and spxa50r < THRESHOLDS["SPXA50R_REPAIR"]:
-        bearish_cont += 2
-
-    if pd.notna(cpce) and cpce >= THRESHOLDS["CPCE_FEAR"]:
-        oversold_bounce += 2
-    if pd.notna(bpspx_bb) and bpspx_bb < THRESHOLDS["BPSPX_BB_LIFT"]:
-        oversold_bounce += 2
-    if pd.notna(nymo) and nymo < 0:
-        oversold_bounce += 1
-    if pd.notna(spxa50r) and spxa50r >= 25:
-        oversold_bounce += 1
-
-    if qwen_repair_trigger(snapshot):
-        true_repair += 3
-    if pd.notna(bpspx) and bpspx > THRESHOLDS["BPSPX_CONFIRM"]:
-        true_repair += 2
-    if pd.notna(nymo) and nymo > THRESHOLDS["NYMO_HEALTHY"]:
-        true_repair += 1
-    if pd.notna(nysi) and nysi > THRESHOLDS["NYSI_TREND_OK"]:
-        true_repair += 2
-    if pd.notna(nyad) and pd.notna(spxadp) and nyad > THRESHOLDS["NYAD_THRUST"] and spxadp > THRESHOLDS["SPXADP_THRUST"]:
-        true_repair += 2
-
-    return {
-        "Bearish continuation score": bearish_cont,
-        "Oversold bounce score": oversold_bounce,
-        "True repair score": true_repair,
+    diag = {
+        "Date": str(last["date"].date()),
+        "Close": None if pd.isna(last["close"]) else round(float(last["close"]), 2),
+        "Bollinger %B(20,2)": None if pd.isna(last["pct_b20"]) else round(float(last["pct_b20"]), 2),
+        "RSI14": None if pd.isna(last["rsi14"]) else round(float(last["rsi14"]), 2),
+        "CCI20": None if pd.isna(last["cci20"]) else round(float(last["cci20"]), 2),
+        "TSI": None if pd.isna(last["tsi_fast"]) else round(float(last["tsi_fast"]), 2),
+        "ROC3": None if pd.isna(last["roc3"]) else round(float(last["roc3"]), 2),
+        "ROC5": None if pd.isna(last["roc5"]) else round(float(last["roc5"]), 2),
+        "Candle": last["candle_pattern"],
     }
 
-
-def what_changed_today(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str, float]]) -> pd.DataFrame:
-    if not prev_snapshot:
-        return pd.DataFrame(columns=["Indicator", "Current", "Prior", "Delta", "Interpretation"])
-
-    rows = []
-    watch = [
-        "$BPSPX",
-        "$BPSPX_%B",
-        "$SPXA50R",
-        "$NYMO",
-        "$NYSI",
-        "$NYAD",
-        "$SPXADP",
-        "$CPCE",
-        "RSP:SPY",
-        "VXX",
-    ]
-
-    for key in watch:
-        cur = get_snapshot_val(snapshot, key)
-        prev = get_snapshot_val(prev_snapshot, key)
-        if pd.isna(cur) and pd.isna(prev):
-            continue
-
-        delta = np.nan
-        if pd.notna(cur) and pd.notna(prev):
-            delta = cur - prev
-
-        interp = ""
-        if key == "$BPSPX_%B":
-            if pd.notna(cur):
-                if cur > THRESHOLDS["BPSPX_BB_LIFT"]:
-                    interp = "Lifted off lower band"
-                else:
-                    interp = "Still lower-band pressure"
-        elif key == "$SPXA50R":
-            if pd.notna(cur):
-                if cur > THRESHOLDS["SPXA50R_REPAIR"]:
-                    interp = "Repair threshold passed"
-                elif cur >= 25:
-                    interp = "Improving but incomplete"
-                else:
-                    interp = "Weak breadth depth"
-        elif key == "$NYMO":
-            if pd.notna(cur):
-                if cur > THRESHOLDS["NYMO_HEALTHY"]:
-                    interp = "Near healthier momentum"
-                elif cur < THRESHOLDS["NYMO_WASHOUT"]:
-                    interp = "Washout momentum"
-                else:
-                    interp = "Still negative momentum"
-        elif key == "$NYSI":
-            if pd.notna(cur):
-                interp = "Trend durability improving" if cur > THRESHOLDS["NYSI_TREND_OK"] else "Trend still damaged"
-        elif key == "$CPCE":
-            if pd.notna(cur):
-                interp = "Fear support present" if cur >= THRESHOLDS["CPCE_FEAR"] else "Fear support fading"
-        elif key == "VXX":
-            if pd.notna(delta):
-                interp = "Vol easing" if delta < 0 else "Vol rising"
-        elif key == "RSP:SPY":
-            if pd.notna(delta):
-                interp = "EW improving" if delta >= 0 else "EW lagging"
-        elif key == "$NYAD":
-            if pd.notna(cur):
-                interp = "Potential thrust" if cur > THRESHOLDS["NYAD_THRUST"] else "No thrust"
-        elif key == "$SPXADP":
-            if pd.notna(cur):
-                interp = "Potential thrust" if cur > THRESHOLDS["SPXADP_THRUST"] else "No thrust"
-
-        rows.append(
-            {
-                "Indicator": key,
-                "Current": None if pd.isna(cur) else round(float(cur), 2),
-                "Prior": None if pd.isna(prev) else round(float(prev), 2),
-                "Delta": None if pd.isna(delta) else round(float(delta), 2),
-                "Interpretation": interp,
-            }
-        )
-
-    return pd.DataFrame(rows)
+    return price_fig, osc_fig, diag
 
 
-def build_momentum_context(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str, float]]) -> pd.DataFrame:
-    rows = []
+# ============================================================
+# LLM PROMPT + API
+# ============================================================
+def build_llm_prompt(
+    snapshot: Dict[str, float],
+    prev_snapshot: Optional[Dict[str, float]],
+    thresholds: Dict[str, float],
+    upload_history_df: pd.DataFrame,
+    weekly_df: pd.DataFrame,
+) -> str:
+    stage_num, stage_name = breadth_stage(snapshot, thresholds)
+    repair = qwen_repair_trigger(snapshot, thresholds)
+    confluence = breadth_confluence_score(snapshot, thresholds)
+    bounce_score, notes = bounce_quality(snapshot, prev_snapshot, thresholds)
+    scenarios = scenario_scores(snapshot, thresholds)
+    failed_risk, short_probe_ok, failed_reasons = failed_bounce_risk(snapshot, prev_snapshot, thresholds)
 
-    def classify(indicator: str, value: float, delta: float) -> str:
-        if pd.isna(value):
-            return "Missing"
-        if indicator == "$NYMO":
-            if value < THRESHOLDS["NYMO_WASHOUT"]:
-                return "Washout"
-            if value < THRESHOLDS["NYMO_HEALTHY"]:
-                return "Negative"
-            return "Healthy"
-        if indicator == "$NYSI":
-            if value < THRESHOLDS["NYSI_LEVERAGE_OK"]:
-                return "Damaged"
-            if value < THRESHOLDS["NYSI_TREND_OK"]:
-                return "Improving but negative"
-            return "Positive"
-        if indicator == "$BPSPX_%B":
-            if value < THRESHOLDS["BPSPX_BB_LIFT"]:
-                return "Pinned low"
-            return "Lifted"
-        if indicator == "$SPXA50R":
-            if value < 25:
-                return "Weak"
-            if value <= THRESHOLDS["SPXA50R_REPAIR"]:
-                return "Near repair"
-            return "Repair passed"
-        return "Neutral"
+    recent_uploads = upload_history_df.tail(5).to_dict(orient="records") if not upload_history_df.empty else []
+    weekly_rows = weekly_df.to_dict(orient="records") if not weekly_df.empty else []
 
-    for key in ["$BPSPX_%B", "$SPXA50R", "$NYMO", "$NYSI", "$NYAD", "$SPXADP"]:
-        cur = get_snapshot_val(snapshot, key)
-        prev = get_snapshot_val(prev_snapshot or {}, key)
-        delta = cur - prev if pd.notna(cur) and pd.notna(prev) else np.nan
-        rows.append(
-            {
-                "Indicator": key,
-                "Current": None if pd.isna(cur) else round(float(cur), 2),
-                "Delta": None if pd.isna(delta) else round(float(delta), 2),
-                "State": classify(key, cur, delta),
-            }
-        )
+    prompt = f"""
+You are a market breadth regime analyst.
 
-    return pd.DataFrame(rows)
+Interpret this structured breadth dashboard.
+
+Rules:
+- distinguish oversold bounce vs true repair vs failed bounce risk
+- discuss immediate delta vs prior upload
+- discuss short trend from recent uploads
+- discuss weekly trend
+- give separate guidance for:
+  1. existing long holder
+  2. new long entry
+  3. leverage long
+  4. failed-bounce short probe
+- do not invent probabilities; use weighted scenario language
+- be concise but specific
+
+Current state:
+- Stage: {stage_num} ({stage_name})
+- Repair trigger: {repair}
+- Breadth Confluence Score: {confluence}/10
+- Bounce Quality Score: {bounce_score}/9
+- Failed-bounce risk: {failed_risk}
+- Short probe eligible: {short_probe_ok}
+- Bounce notes: {notes}
+- Failed-bounce reasons: {failed_reasons}
+- Scenario scores: {scenarios}
+
+Current snapshot:
+- BPSPX: {snapshot.get("$BPSPX", np.nan)}
+- BPSPX %B: {snapshot.get("$BPSPX_%B", np.nan)}
+- SPXA50R: {snapshot.get("$SPXA50R", np.nan)}
+- NYMO: {snapshot.get("$NYMO", np.nan)}
+- NYSI: {snapshot.get("$NYSI", np.nan)}
+- NYAD: {snapshot.get("$NYAD", np.nan)}
+- SPXADP: {snapshot.get("$SPXADP", np.nan)}
+- CPCE: {snapshot.get("$CPCE", np.nan)}
+- NYHL: {snapshot.get("$NYHL", np.nan)}
+- VXX: {snapshot.get("VXX", np.nan)}
+- RSP:SPY: {snapshot.get("RSP:SPY", np.nan)}
+- NYMO Proxy: {snapshot.get("NYMO_PROXY", np.nan)}
+
+Prior snapshot:
+- BPSPX: {(prev_snapshot or {}).get("$BPSPX", np.nan)}
+- BPSPX %B: {(prev_snapshot or {}).get("$BPSPX_%B", np.nan)}
+- SPXA50R: {(prev_snapshot or {}).get("$SPXA50R", np.nan)}
+- NYMO: {(prev_snapshot or {}).get("$NYMO", np.nan)}
+- NYSI: {(prev_snapshot or {}).get("$NYSI", np.nan)}
+- VXX: {(prev_snapshot or {}).get("VXX", np.nan)}
+- RSP:SPY: {(prev_snapshot or {}).get("RSP:SPY", np.nan)}
+
+Recent upload history:
+{json.dumps(recent_uploads, indent=2)}
+
+Weekly table:
+{json.dumps(weekly_rows, indent=2)}
+
+Return sections:
+- Executive Summary
+- Immediate Delta
+- Short Trend
+- Weekly Context
+- Action Guidance
+- What Confirms Repair
+- What Invalidates Bounce
+""".strip()
+
+    return prompt
 
 
-def action_dashboard(snapshot: Dict[str, float]) -> pd.DataFrame:
-    stage_num, stage_name = breadth_stage(snapshot)
-    repair_on = qwen_repair_trigger(snapshot)
-    bpspx = get_snapshot_val(snapshot, "$BPSPX")
-    nysi = get_snapshot_val(snapshot, "$NYSI")
-    nymo = get_snapshot_val(snapshot, "$NYMO")
-
-    rows = []
-
-    rows.append(
-        {
-            "Use Case": "New long entry",
-            "Status": "YES" if repair_on and pd.notna(bpspx) and bpspx > THRESHOLDS["BPSPX_CONFIRM"] else "NO / EARLY",
-            "Guidance": "Prefer only after repair trigger + participation confirmation.",
-        }
+def call_openai_analysis(client: OpenAI, model_name: str, prompt: str) -> str:
+    response = client.responses.create(
+        model=model_name,
+        input=prompt,
     )
-
-    rows.append(
-        {
-            "Use Case": "Existing long hold",
-            "Status": "YES" if stage_num >= 1 else "CAUTION",
-            "Guidance": "Hold only if bounce is improving; weak if lower-band pressure persists.",
-        }
-    )
-
-    rows.append(
-        {
-            "Use Case": "Leverage long",
-            "Status": "YES" if repair_on and pd.notna(bpspx) and bpspx > THRESHOLDS["BPSPX_CONFIRM"] and pd.notna(nysi) and nysi > THRESHOLDS["NYSI_LEVERAGE_OK"] else "NO",
-            "Guidance": "Reserve leverage for broader confirmation and improving summation.",
-        }
-    )
-
-    rows.append(
-        {
-            "Use Case": "New short entry",
-            "Status": "WAIT" if stage_num <= 1 else "LESS ATTRACTIVE",
-            "Guidance": "Prefer failed bounce / rejection setups rather than fresh panic lows.",
-        }
-    )
-
-    rows.append(
-        {
-            "Use Case": "Probe long",
-            "Status": "YES" if stage_num == 1 else "NO",
-            "Guidance": "Small size only when bounce starts but full repair not yet confirmed.",
-        }
-    )
-
-    rows.append(
-        {
-            "Use Case": "Add risk",
-            "Status": "YES" if stage_num >= 3 and pd.notna(nymo) and nymo > THRESHOLDS["NYMO_HEALTHY"] else "NO",
-            "Guidance": f"Current stage: {stage_num} ({stage_name}).",
-        }
-    )
-
-    return pd.DataFrame(rows)
-
-
-def build_narrative(snapshot: Dict[str, float], prev_snapshot: Optional[Dict[str, float]] = None) -> str:
-    state = classify_market_state(snapshot)
-    stage_num, stage_name = breadth_stage(snapshot)
-    bq, notes = bounce_quality(snapshot, prev_snapshot)
-
-    bpspx = get_snapshot_val(snapshot, "$BPSPX")
-    bpspx_bb = get_snapshot_val(snapshot, "$BPSPX_%B")
-    spxa50r = get_snapshot_val(snapshot, "$SPXA50R")
-    nymo = get_snapshot_val(snapshot, "$NYMO")
-    nysi = get_snapshot_val(snapshot, "$NYSI")
-    nyad = get_snapshot_val(snapshot, "$NYAD")
-    spxadp = get_snapshot_val(snapshot, "$SPXADP")
-
-    parts = [f"State: {state}.", f"Stage {stage_num}: {stage_name}."]
-
-    if pd.notna(bpspx_bb):
-        parts.append(f"BPSPX Bollinger %B is {bpspx_bb:.2f}.")
-        if bpspx_bb < THRESHOLDS["BPSPX_BB_LIFT"]:
-            parts.append("Breadth is still pinned near the lower Bollinger zone.")
-        else:
-            parts.append("Breadth has lifted off the lower Bollinger zone.")
-
-    if pd.notna(bpspx) and pd.notna(spxa50r):
-        parts.append(f"BPSPX {bpspx:.2f} and SPXA50R {spxa50r:.2f} define participation and depth.")
-
-    if pd.notna(nymo):
-        parts.append(f"Official NYMO is {nymo:.2f}.")
-    if pd.notna(nysi):
-        parts.append(f"NYSI is {nysi:.2f}.")
-
-    if qwen_repair_trigger(snapshot):
-        parts.append("Qwen repair trigger is active: BPSPX %B > 0.20 and SPXA50R > 30.")
-    else:
-        parts.append("Qwen repair trigger is not active yet.")
-
-    if pd.notna(nyad) and pd.notna(spxadp) and nyad > THRESHOLDS["NYAD_THRUST"] and spxadp > THRESHOLDS["SPXADP_THRUST"]:
-        parts.append("Breadth thrust conditions are present.")
-
-    parts.append(f"Bounce Quality Score: {bq}/9 ({'; '.join(notes) if notes else 'limited confirmation'}).")
-
-    if pd.notna(bpspx) and pd.notna(spxa50r):
-        if bpspx > THRESHOLDS["BPSPX_CONFIRM"] and spxa50r > THRESHOLDS["SPXA50R_REPAIR"]:
-            parts.append("Broad repair is approaching stronger confirmation territory.")
-        else:
-            parts.append("Repair may be underway, but full confirmation is still missing.")
-
-    return " ".join(parts)
-
-
-def rank_signals(snapshot: Dict[str, float]) -> pd.DataFrame:
-    rows = []
-
-    def add(signal: str, status: str, detail: str, score: int):
-        rows.append({"Signal": signal, "Status": status, "Detail": detail, "Score": score})
-
-    bpspx = get_snapshot_val(snapshot, "$BPSPX")
-    bpspx_bb = get_snapshot_val(snapshot, "$BPSPX_%B")
-    spxa50r = get_snapshot_val(snapshot, "$SPXA50R")
-    nymo = get_snapshot_val(snapshot, "$NYMO")
-    nysi = get_snapshot_val(snapshot, "$NYSI")
-    nyad = get_snapshot_val(snapshot, "$NYAD")
-    spxadp = get_snapshot_val(snapshot, "$SPXADP")
-    nyhl = get_snapshot_val(snapshot, "$NYHL")
-    ratio = get_snapshot_val(snapshot, "RSP:SPY")
-
-    add(
-        "Bollinger lift",
-        "PASS" if pd.notna(bpspx_bb) and bpspx_bb > THRESHOLDS["BPSPX_BB_LIFT"] else "WAIT",
-        f"BPSPX %B {fmt_num(bpspx_bb)}",
-        1 if pd.notna(bpspx_bb) and bpspx_bb > THRESHOLDS["BPSPX_BB_LIFT"] else 0,
-    )
-    add(
-        "Depth repair",
-        "PASS" if pd.notna(spxa50r) and spxa50r > THRESHOLDS["SPXA50R_REPAIR"] else "WAIT",
-        f"SPXA50R {fmt_num(spxa50r)}",
-        2 if pd.notna(spxa50r) and spxa50r > THRESHOLDS["SPXA50R_REPAIR"] else 0,
-    )
-    add(
-        "Qwen repair trigger",
-        "PASS" if qwen_repair_trigger(snapshot) else "WAIT",
-        f"BPSPX %B {fmt_num(bpspx_bb)} and SPXA50R {fmt_num(spxa50r)}",
-        2 if qwen_repair_trigger(snapshot) else 0,
-    )
-    add(
-        "Participation",
-        "PASS" if pd.notna(bpspx) and bpspx > THRESHOLDS["BPSPX_CONFIRM"] else "WAIT",
-        f"BPSPX {fmt_num(bpspx)}",
-        2 if pd.notna(bpspx) and bpspx > THRESHOLDS["BPSPX_CONFIRM"] else 0,
-    )
-    add(
-        "Momentum thrust",
-        "PASS" if pd.notna(nyad) and pd.notna(spxadp) and nyad > THRESHOLDS["NYAD_THRUST"] and spxadp > THRESHOLDS["SPXADP_THRUST"] else "PARTIAL",
-        f"NYAD {fmt_num(nyad, 0)}, SPXADP {fmt_num(spxadp, 1)}",
-        2 if pd.notna(nyad) and pd.notna(spxadp) and nyad > THRESHOLDS["NYAD_THRUST"] and spxadp > THRESHOLDS["SPXADP_THRUST"] else 1,
-    )
-    add(
-        "Official NYMO",
-        "PASS" if pd.notna(nymo) and nymo > THRESHOLDS["NYMO_HEALTHY"] else "PARTIAL",
-        f"NYMO {fmt_num(nymo)}",
-        2 if pd.notna(nymo) and nymo > THRESHOLDS["NYMO_HEALTHY"] else 1 if pd.notna(nymo) and nymo > -50 else 0,
-    )
-    add(
-        "Durability",
-        "PASS" if pd.notna(nysi) and nysi > THRESHOLDS["NYSI_TREND_OK"] else "WAIT",
-        f"NYSI {fmt_num(nysi)}",
-        2 if pd.notna(nysi) and nysi > THRESHOLDS["NYSI_TREND_OK"] else 0,
-    )
-    add(
-        "Leadership",
-        "PASS" if pd.notna(nyhl) and nyhl > THRESHOLDS["NYHL_POSITIVE"] else "WAIT",
-        f"NYHL {fmt_num(nyhl)}, RSP:SPY {fmt_num(ratio, 3)}",
-        1 if pd.notna(nyhl) and nyhl > THRESHOLDS["NYHL_POSITIVE"] else 0,
-    )
-
-    return pd.DataFrame(rows).sort_values(["Score", "Signal"], ascending=[False, True]).reset_index(drop=True)
+    return response.output_text
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.header("Inputs")
-    hist_file = st.file_uploader("Historical CSV", type=["csv"])
-    rt_file = st.file_uploader("Realtime CSV", type=["csv"])
-    show_symbols = st.multiselect("Charts", CORE_SYMBOLS, default=DEFAULT_CHARTS)
+    st.header("Baseline / Uploads")
+
+    baseline_file = st.file_uploader("Upload historical baseline CSV", type=["csv"])
+    realtime_file = st.file_uploader("Upload new realtime / EOD snapshot CSV", type=["csv"])
+
+    upload_tag = st.text_input("Upload tag", value="manual upload")
 
     st.markdown("---")
     st.subheader("Thresholds")
-    THRESHOLDS["BPSPX_BB_LIFT"] = st.number_input("BPSPX %B repair lift", value=float(THRESHOLDS["BPSPX_BB_LIFT"]), step=0.01, format="%.2f")
-    THRESHOLDS["SPXA50R_REPAIR"] = st.number_input("SPXA50R repair threshold", value=float(THRESHOLDS["SPXA50R_REPAIR"]), step=1.0, format="%.1f")
-    THRESHOLDS["BPSPX_CONFIRM"] = st.number_input("BPSPX participation confirm", value=float(THRESHOLDS["BPSPX_CONFIRM"]), step=1.0, format="%.1f")
-    THRESHOLDS["NYMO_HEALTHY"] = st.number_input("NYMO healthy threshold", value=float(THRESHOLDS["NYMO_HEALTHY"]), step=5.0, format="%.1f")
-    THRESHOLDS["NYSI_LEVERAGE_OK"] = st.number_input("NYSI leverage threshold", value=float(THRESHOLDS["NYSI_LEVERAGE_OK"]), step=5.0, format="%.1f")
+    thresholds = DEFAULT_THRESHOLDS.copy()
+    thresholds["BPSPX_BB_LIFT"] = st.number_input("BPSPX %B repair lift", value=float(thresholds["BPSPX_BB_LIFT"]), step=0.01, format="%.2f")
+    thresholds["SPXA50R_REPAIR"] = st.number_input("SPXA50R repair threshold", value=float(thresholds["SPXA50R_REPAIR"]), step=1.0, format="%.1f")
+    thresholds["BPSPX_CONFIRM"] = st.number_input("BPSPX confirm threshold", value=float(thresholds["BPSPX_CONFIRM"]), step=1.0, format="%.1f")
+    thresholds["NYMO_HEALTHY"] = st.number_input("NYMO healthy threshold", value=float(thresholds["NYMO_HEALTHY"]), step=5.0, format="%.1f")
+    thresholds["NYSI_LEVERAGE_OK"] = st.number_input("NYSI leverage threshold", value=float(thresholds["NYSI_LEVERAGE_OK"]), step=5.0, format="%.1f")
 
-if hist_file is None or rt_file is None:
-    st.info("Please upload both the historical CSV and the realtime CSV.")
+    st.markdown("---")
+    st.subheader("Display")
+    show_charts = st.multiselect("Minimal charts", CORE_SYMBOLS, default=DEFAULT_MINIMAL_CHARTS)
+
+    st.markdown("---")
+    st.subheader("ChatGPT API")
+    run_llm = st.checkbox("Run ChatGPT analysis", value=False)
+    show_prompt = st.checkbox("Show prompt", value=False)
+
+    st.markdown("---")
+    if st.button("Clear stored baseline"):
+        if BASELINE_PATH.exists():
+            BASELINE_PATH.unlink()
+        if BASELINE_META_PATH.exists():
+            BASELINE_META_PATH.unlink()
+        st.success("Stored baseline cleared.")
+
+    if st.button("Clear upload history"):
+        if UPLOAD_HISTORY_PATH.exists():
+            UPLOAD_HISTORY_PATH.unlink()
+        st.success("Upload history cleared.")
+
+    if st.button("Clear LLM history"):
+        if LLM_HISTORY_PATH.exists():
+            LLM_HISTORY_PATH.unlink()
+        st.success("LLM history cleared.")
+
+
+# ============================================================
+# BASELINE MEMORY
+# ============================================================
+baseline_meta = load_json(BASELINE_META_PATH, default={})
+
+if baseline_file is not None:
+    try:
+        parsed_baseline = parse_stockcharts_historical_from_bytes(baseline_file.getvalue())
+        parsed_baseline.to_parquet(BASELINE_PATH, index=False)
+        baseline_meta = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "source_filename": baseline_file.name,
+            "rows": int(len(parsed_baseline)),
+            "symbols": int(parsed_baseline["symbol"].nunique()),
+        }
+        save_json(BASELINE_META_PATH, baseline_meta)
+        st.success("Historical baseline saved.")
+    except Exception as e:
+        st.error(f"Could not save baseline: {e}")
+
+if not BASELINE_PATH.exists():
+    st.info("Upload and save the historical baseline first.")
     st.stop()
 
-
-# ============================================================
-# LOAD
-# ============================================================
 try:
-    with st.spinner("Parsing files and building indicators..."):
-        hist_long = parse_historical_raw_from_bytes(hist_file.getvalue())
-        rt = load_realtime_table_from_bytes(rt_file.getvalue())
-        hist_feat = add_indicator_features(hist_long)
-        wide = wide_from_long(hist_long)
+    hist_long = pd.read_parquet(BASELINE_PATH)
+    hist_feat = add_indicator_features(hist_long)
 except Exception as e:
-    st.error(f"Load failed: {e}")
+    st.error(f"Could not load stored baseline: {e}")
     st.stop()
 
-if hist_long.empty:
-    st.error("Historical data is empty after parsing.")
-    st.stop()
-
-if wide.empty:
-    st.error("Wide history could not be built.")
-    st.stop()
-
-latest_hist_date = wide.index.max()
-prev_hist_date = wide.index[-2] if len(wide.index) > 1 else latest_hist_date
-
-latest_hist = wide.loc[latest_hist_date].to_dict()
-prev_hist = wide.loc[prev_hist_date].to_dict() if prev_hist_date is not None else {}
-
-snapshot: Dict[str, float] = latest_hist.copy()
-prev_snapshot: Dict[str, float] = prev_hist.copy()
-
-# add realtime closes into current snapshot
-for _, row in rt.iterrows():
-    sym = row["Symbol"]
-    close_val = pd.to_numeric(row["Close"], errors="coerce")
-    if pd.notna(close_val):
-        snapshot[sym] = float(close_val)
-
-# add latest feature values into snapshot
-latest_feat_rows = hist_feat.sort_values("date").groupby("symbol", as_index=False).tail(1)
-for _, row in latest_feat_rows.iterrows():
-    sym = row["symbol"]
-    snapshot[f"{sym}_%B"] = row.get("pct_b20", np.nan)
-    snapshot[f"{sym}_RSI14"] = row.get("rsi14", np.nan)
-    snapshot[f"{sym}_CCI20"] = row.get("cci20", np.nan)
-    snapshot[f"{sym}_TSI"] = row.get("tsi_fast", np.nan)
-
-    prev_rows = hist_feat[hist_feat["symbol"] == sym].sort_values("date")
-    if len(prev_rows) >= 2:
-        prev_row = prev_rows.iloc[-2]
-        prev_snapshot[f"{sym}_%B"] = prev_row.get("pct_b20", np.nan)
-        prev_snapshot[f"{sym}_RSI14"] = prev_row.get("rsi14", np.nan)
-        prev_snapshot[f"{sym}_CCI20"] = prev_row.get("cci20", np.nan)
-        prev_snapshot[f"{sym}_TSI"] = prev_row.get("tsi_fast", np.nan)
-
-bpspx_dir = derive_bpspx_direction(get_snapshot_val(snapshot, "$BPSPX"), get_snapshot_val(prev_snapshot, "$BPSPX"))
-snapshot["NYMO_PROXY"] = compute_nymo_proxy(
-    get_snapshot_val(snapshot, "$NYAD"),
-    get_snapshot_val(snapshot, "$SPXADP"),
-    bpspx_dir,
-)
-prev_snapshot["NYMO_PROXY"] = compute_nymo_proxy(
-    get_snapshot_val(prev_snapshot, "$NYAD"),
-    get_snapshot_val(prev_snapshot, "$SPXADP"),
-    derive_bpspx_direction(get_snapshot_val(prev_snapshot, "$BPSPX"), np.nan),
-)
-
-stage_num, stage_name = breadth_stage(snapshot)
-repair_trigger_on = qwen_repair_trigger(snapshot)
-scenarios = scenario_scores(snapshot)
-bq, bq_notes = bounce_quality(snapshot, prev_snapshot)
-
-changed_df = what_changed_today(snapshot, prev_snapshot)
-momentum_df = build_momentum_context(snapshot, prev_snapshot)
-actions_df = action_dashboard(snapshot)
-ranking_df = rank_signals(snapshot)
+baseline_snapshot = get_latest_feature_snapshot(hist_feat)
+baseline_prior_snapshot = get_prior_feature_snapshot(hist_feat)
+weekly_df = weekly_analysis(hist_feat)
+upload_history_df = load_upload_history()
 
 
 # ============================================================
-# TOP METRICS
+# CURRENT SNAPSHOT
 # ============================================================
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("BPSPX", fmt_num(get_snapshot_val(snapshot, "$BPSPX")))
-c2.metric("BPSPX %B", fmt_num(get_snapshot_val(snapshot, "$BPSPX_%B")))
-c3.metric("SPXA50R", fmt_num(get_snapshot_val(snapshot, "$SPXA50R")))
-c4.metric("Official NYMO", fmt_num(get_snapshot_val(snapshot, "$NYMO")))
-c5.metric("NYSI", fmt_num(get_snapshot_val(snapshot, "$NYSI")))
-c6.metric("NYMO Proxy", fmt_num(get_snapshot_val(snapshot, "NYMO_PROXY")))
+snapshot = baseline_snapshot.copy()
+prev_snapshot = baseline_prior_snapshot.copy()
 
-left, right = st.columns([1.3, 0.7])
+realtime_df = pd.DataFrame()
 
-with left:
-    st.subheader("Market Narrative")
-    st.write(build_narrative(snapshot, prev_snapshot))
+if realtime_file is not None:
+    try:
+        realtime_df = parse_realtime_snapshot_from_bytes(realtime_file.getvalue())
 
-    st.subheader("Signal Ranking")
-    st.dataframe(ranking_df, use_container_width=True, hide_index=True)
+        for _, row in realtime_df.iterrows():
+            sym = row["Symbol"]
+            close_val = safe_float(row["Close"])
+            if pd.notna(close_val):
+                snapshot[sym] = close_val
 
-with right:
-    st.subheader("Regime Status")
-    if repair_trigger_on:
-        st.success("Qwen Repair Trigger: ACTIVE")
+        snapshot["NYMO_PROXY"] = compute_nymo_proxy(snapshot, thresholds, prev_snapshot)
+
+        summary_row = build_upload_summary(snapshot, thresholds, upload_tag, prev_snapshot)
+        append_upload_history(summary_row)
+        upload_history_df = load_upload_history()
+
+        st.success("Realtime snapshot processed and appended to upload history.")
+    except Exception as e:
+        st.error(f"Could not parse realtime snapshot: {e}")
+        st.stop()
+else:
+    snapshot["NYMO_PROXY"] = compute_nymo_proxy(snapshot, thresholds, prev_snapshot)
+
+
+# ============================================================
+# CALCULATED TABLES
+# ============================================================
+stage_num, stage_name = breadth_stage(snapshot, thresholds)
+repair_trigger = qwen_repair_trigger(snapshot, thresholds)
+bounce_score, bounce_notes = bounce_quality(snapshot, prev_snapshot, thresholds)
+confluence_score = breadth_confluence_score(snapshot, thresholds)
+scenarios = scenario_scores(snapshot, thresholds)
+failed_risk, short_probe_ok, failed_reasons = failed_bounce_risk(snapshot, prev_snapshot, thresholds)
+
+recent_uploads_df = latest_upload_rows(5)
+intraday_df = intraday_multi_upload_analysis(recent_uploads_df)
+
+action_rows = [
+    {
+        "Use Case": "Existing long hold",
+        "Status": "YES" if stage_num >= 1 else "CAUTION",
+        "Guidance": "Hold only if bounce is improving and confluence is not deteriorating.",
+    },
+    {
+        "Use Case": "New long entry",
+        "Status": "YES" if repair_trigger and snapshot.get("$BPSPX", np.nan) > thresholds["BPSPX_CONFIRM"] else "NO / EARLY",
+        "Guidance": "Prefer repair trigger + participation confirmation.",
+    },
+    {
+        "Use Case": "Leverage long",
+        "Status": "YES" if repair_trigger and snapshot.get("$BPSPX", np.nan) > thresholds["BPSPX_CONFIRM"] and snapshot.get("$NYSI", np.nan) > thresholds["NYSI_LEVERAGE_OK"] else "NO",
+        "Guidance": "Reserve leverage for broader confirmation.",
+    },
+    {
+        "Use Case": "Short probe",
+        "Status": "ONLY FAILED BOUNCE" if short_probe_ok else "LESS ATTRACTIVE",
+        "Guidance": "Prefer failed bounce / rejection, not fresh panic lows.",
+    },
+]
+actions_df = pd.DataFrame(action_rows)
+
+momentum_rows = []
+for key in ["$BPSPX_%B", "$SPXA50R", "$NYMO", "$NYSI", "$NYAD", "$SPXADP"]:
+    cur = snapshot.get(key, np.nan)
+    prev = prev_snapshot.get(key, np.nan)
+    delta = cur - prev if pd.notna(cur) and pd.notna(prev) else np.nan
+
+    if pd.isna(cur):
+        state = "Missing"
+    elif key == "$BPSPX_%B":
+        state = "Lifted" if cur > thresholds["BPSPX_BB_LIFT"] else "Pinned low"
+    elif key == "$SPXA50R":
+        state = "Repair passed" if cur > thresholds["SPXA50R_REPAIR"] else ("Near repair" if cur >= 25 else "Weak")
+    elif key == "$NYMO":
+        state = "Healthy" if cur > thresholds["NYMO_HEALTHY"] else ("Washout" if cur < thresholds["NYMO_WASHOUT"] else "Negative")
+    elif key == "$NYSI":
+        state = "Positive" if cur > thresholds["NYSI_POSITIVE"] else ("Damaged" if cur < thresholds["NYSI_LEVERAGE_OK"] else "Improving but negative")
+    elif key == "$NYAD":
+        state = "Potential thrust" if cur > thresholds["NYAD_THRUST"] else "No thrust"
     else:
-        st.warning("Qwen Repair Trigger: Not Active")
+        state = "Potential thrust" if cur > thresholds["SPXADP_THRUST"] else "No thrust"
 
-    st.info(f"Stage {stage_num}: {stage_name}")
-    st.metric("Bounce Quality", f"{bq}/9")
-    st.write("; ".join(bq_notes) if bq_notes else "Limited confirmation")
+    momentum_rows.append(
+        {
+            "Indicator": key,
+            "Current": None if pd.isna(cur) else round(float(cur), 2),
+            "Prior": None if pd.isna(prev) else round(float(prev), 2),
+            "Delta": None if pd.isna(delta) else round(float(delta), 2),
+            "State": state,
+        }
+    )
+momentum_df = pd.DataFrame(momentum_rows)
 
 
 # ============================================================
-# SCENARIO SCORES
+# SUMMARY
+# ============================================================
+st.subheader("Regime Summary")
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("BPSPX", fmt_num(snapshot.get("$BPSPX", np.nan)))
+c2.metric("BPSPX %B", fmt_num(snapshot.get("$BPSPX_%B", np.nan)))
+c3.metric("SPXA50R", fmt_num(snapshot.get("$SPXA50R", np.nan)))
+c4.metric("NYMO", fmt_num(snapshot.get("$NYMO", np.nan)))
+c5.metric("NYSI", fmt_num(snapshot.get("$NYSI", np.nan)))
+c6.metric("NYMO Proxy", fmt_num(snapshot.get("NYMO_PROXY", np.nan)))
+
+d1, d2, d3, d4, d5 = st.columns(5)
+d1.metric("Breadth Confluence", f"{confluence_score}/10")
+d2.metric("Bounce Quality", f"{bounce_score}/9")
+d3.metric("Regime Stage", f"{stage_num}")
+d4.metric("Repair Trigger", "ON" if repair_trigger else "OFF")
+d5.metric("Failed Bounce Risk", failed_risk)
+
+st.write(build_narrative(snapshot, prev_snapshot, thresholds))
+
+
+# ============================================================
+# SCENARIOS
 # ============================================================
 st.subheader("Scenario Scores")
-score_cols = st.columns(3)
-score_cols[0].metric("Bearish continuation", scenarios["Bearish continuation score"])
-score_cols[1].metric("Oversold bounce", scenarios["Oversold bounce score"])
-score_cols[2].metric("True repair", scenarios["True repair score"])
+s1, s2, s3 = st.columns(3)
+s1.metric("Bearish continuation", scenarios["Bearish continuation"])
+s2.metric("Oversold bounce", scenarios["Oversold bounce"])
+s3.metric("True repair", scenarios["True repair"])
 st.caption("These are weighted scenario scores, not statistical probabilities.")
 
 
 # ============================================================
-# ACTION DASHBOARD
+# ACTION + MOMENTUM
 # ============================================================
-st.subheader("Action Dashboard")
-st.dataframe(actions_df, use_container_width=True, hide_index=True)
+a1, a2 = st.columns(2)
 
+with a1:
+    st.subheader("Action Dashboard")
+    st.dataframe(actions_df, use_container_width=True, hide_index=True)
 
-# ============================================================
-# MOMENTUM CONTEXT + CHANGES
-# ============================================================
-m1, m2 = st.columns(2)
-
-with m1:
+with a2:
     st.subheader("Momentum Context")
     st.dataframe(momentum_df, use_container_width=True, hide_index=True)
 
-with m2:
-    st.subheader("What Changed vs Prior Day")
-    st.dataframe(changed_df, use_container_width=True, hide_index=True)
+
+# ============================================================
+# FAILED BOUNCE DETAIL
+# ============================================================
+st.subheader("Failed-Bounce Short Framework")
+fb1, fb2 = st.columns(2)
+with fb1:
+    st.metric("Short Probe Eligible", "YES" if short_probe_ok else "NO")
+with fb2:
+    st.metric("Failed-Bounce Risk", failed_risk)
+
+if failed_reasons:
+    st.write("Drivers: " + "; ".join(failed_reasons))
+
+
+# ============================================================
+# MULTI-UPLOAD / INTRADAY
+# ============================================================
+st.subheader("Intraday / Multi-Upload Analysis")
+if intraday_df.empty:
+    st.info("Need at least two saved uploads to compare current vs prior upload.")
+else:
+    st.dataframe(intraday_df, use_container_width=True, hide_index=True)
+
+if not recent_uploads_df.empty:
+    st.subheader("Recent Upload History")
+    st.dataframe(recent_uploads_df, use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# WEEKLY
+# ============================================================
+st.subheader("Weekly Analysis")
+if weekly_df.empty:
+    st.info("Not enough historical data for weekly analysis.")
+else:
+    st.dataframe(weekly_df, use_container_width=True, hide_index=True)
 
 
 # ============================================================
 # REALTIME SNAPSHOT
 # ============================================================
-st.subheader("Realtime Snapshot")
-cols_to_show = [c for c in ["Symbol", "Close", "PctChange"] if c in rt.columns]
-if not cols_to_show:
-    cols_to_show = ["Symbol", "Close"]
-st.dataframe(rt[cols_to_show], use_container_width=True, hide_index=True)
+st.subheader("Current Realtime Snapshot")
+if realtime_df.empty:
+    st.info("No new realtime snapshot uploaded this run. Using stored historical baseline.")
+else:
+    show_cols = [c for c in ["Symbol", "Close", "PctChange"] if c in realtime_df.columns]
+    st.dataframe(realtime_df[show_cols], use_container_width=True, hide_index=True)
 
 
 # ============================================================
-# READINESS
+# MINIMAL CHART PANEL
 # ============================================================
-st.subheader("Readiness")
-r1, r2, r3 = st.columns(3)
-
-rsp_ready = (
-    repair_trigger_on
-    and pd.notna(get_snapshot_val(snapshot, "$BPSPX"))
-    and get_snapshot_val(snapshot, "$BPSPX") > THRESHOLDS["BPSPX_CONFIRM"]
-)
-
-ursp_ready = (
-    repair_trigger_on
-    and pd.notna(get_snapshot_val(snapshot, "$BPSPX"))
-    and pd.notna(get_snapshot_val(snapshot, "$NYSI"))
-    and get_snapshot_val(snapshot, "$BPSPX") > THRESHOLDS["BPSPX_CONFIRM"]
-    and get_snapshot_val(snapshot, "$NYSI") > THRESHOLDS["NYSI_LEVERAGE_OK"]
-)
-
-short_probe_ok = (
-    stage_num <= 1
-    and pd.notna(get_snapshot_val(snapshot, "$NYSI"))
-    and get_snapshot_val(snapshot, "$NYSI") < THRESHOLDS["NYSI_LEVERAGE_OK"]
-)
-
-with r1:
-    if rsp_ready:
-        st.success("RSP Swing Ready")
-    else:
-        st.warning("RSP Swing Not Fully Confirmed")
-
-with r2:
-    if ursp_ready:
-        st.success("URSP / Leverage Ready")
-    else:
-        st.warning("URSP Not Ready")
-
-with r3:
-    if short_probe_ok:
-        st.info("Short Probe Setup: only on failed bounce")
-    else:
-        st.info("Short Probe Setup: not favored now")
-
-
-# ============================================================
-# CHARTS
-# ============================================================
-st.subheader("Historical Charts + Oscillators")
-
-for sym in show_symbols:
-    g = hist_feat[hist_feat["symbol"] == sym].sort_values("date").copy()
-    if g.empty:
+st.subheader("Minimal Chart Panel")
+for sym in show_charts:
+    price_fig, osc_fig, diag = make_symbol_chart(hist_feat, sym, thresholds["BPSPX_BB_LIFT"])
+    if price_fig is None:
         continue
 
-    g["candle_pattern"] = g.apply(detect_candle_pattern, axis=1)
-    g["bear_kiss_50"] = detect_bear_kiss(g, "ma50")
-    g["bull_kiss_50"] = detect_bull_kiss(g, "ma50")
-
-    last = g.iloc[-1]
-
-    with st.expander(sym, expanded=sym in ["$BPSPX", "$SPXA50R", "RSP"]):
-        col_a, col_b = st.columns([1.7, 1])
-
-        with col_a:
-            fig = go.Figure()
-            fig.add_trace(
-                go.Candlestick(
-                    x=g["date"],
-                    open=g["open"],
-                    high=g["high"],
-                    low=g["low"],
-                    close=g["close"],
-                    name=sym,
-                )
-            )
-
-            if g["ma20"].notna().any():
-                fig.add_trace(go.Scatter(x=g["date"], y=g["ma20"], name="MA20"))
-            if g["ma50"].notna().any():
-                fig.add_trace(go.Scatter(x=g["date"], y=g["ma50"], name="MA50"))
-            if g["ma200"].notna().any():
-                fig.add_trace(go.Scatter(x=g["date"], y=g["ma200"], name="MA200"))
-
-            fig.update_layout(
-                height=360,
-                xaxis_rangeslider_visible=False,
-                margin=dict(l=10, r=10, t=20, b=10),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            osc = go.Figure()
-            osc.add_trace(go.Scatter(x=g["date"], y=g["tsi_fast"], name="TSI(4,2,4)"))
-            osc.add_trace(go.Scatter(x=g["date"], y=g["tsi_fast_sig"], name="TSI Signal"))
-            osc.add_trace(go.Scatter(x=g["date"], y=g["cci20"], name="CCI20", visible="legendonly"))
-            osc.add_trace(go.Scatter(x=g["date"], y=g["rsi14"], name="RSI14", visible="legendonly"))
-            osc.add_trace(go.Scatter(x=g["date"], y=g["pct_b20"], name="Bollinger %B(20,2)"))
-            osc.add_hline(y=1.0, line_dash="dash")
-            osc.add_hline(y=0.5, line_dash="dot")
-            osc.add_hline(y=THRESHOLDS["BPSPX_BB_LIFT"], line_dash="dot", annotation_text=f"%B {THRESHOLDS['BPSPX_BB_LIFT']:.2f}")
-            osc.add_hline(y=0.0, line_dash="dash")
-            osc.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10))
-            st.plotly_chart(osc, use_container_width=True)
-
-        with col_b:
-            tsi_cross_up = False
-            tsi_cross_down = False
-
-            if len(g) > 1:
-                prev = g.iloc[-2]
-                if (
-                    pd.notna(last["tsi_fast"])
-                    and pd.notna(last["tsi_fast_sig"])
-                    and pd.notna(prev["tsi_fast"])
-                    and pd.notna(prev["tsi_fast_sig"])
-                ):
-                    tsi_cross_up = (last["tsi_fast"] > last["tsi_fast_sig"]) and (prev["tsi_fast"] <= prev["tsi_fast_sig"])
-                    tsi_cross_down = (last["tsi_fast"] < last["tsi_fast_sig"]) and (prev["tsi_fast"] >= prev["tsi_fast_sig"])
-
-            cci_creep = bool(g["cci20"].tail(3).is_monotonic_increasing) if len(g) >= 3 else False
-            rsi_creep = bool(g["rsi14"].tail(3).is_monotonic_increasing) if len(g) >= 3 else False
-
-            diag = {
-                "Date": str(last["date"].date()),
-                "Close": None if pd.isna(last["close"]) else round(float(last["close"]), 2),
-                "Bollinger %B(20,2)": None if pd.isna(last["pct_b20"]) else round(float(last["pct_b20"]), 2),
-                "ROC3": None if pd.isna(last["roc3"]) else round(float(last["roc3"]), 2),
-                "ROC5": None if pd.isna(last["roc5"]) else round(float(last["roc5"]), 2),
-                "RSI14": None if pd.isna(last["rsi14"]) else round(float(last["rsi14"]), 2),
-                "CCI20": None if pd.isna(last["cci20"]) else round(float(last["cci20"]), 2),
-                "TSI": None if pd.isna(last["tsi_fast"]) else round(float(last["tsi_fast"]), 2),
-                "TSI signal": None if pd.isna(last["tsi_fast_sig"]) else round(float(last["tsi_fast_sig"]), 2),
-                "Candle": last["candle_pattern"],
-                "Bear kiss 50MA": bool_py(last["bear_kiss_50"]),
-                "Bull kiss 50MA": bool_py(last["bull_kiss_50"]),
-                "TSI cross up": bool(tsi_cross_up),
-                "TSI cross down": bool(tsi_cross_down),
-                "CCI creeping up": bool(cci_creep),
-                "RSI creeping up": bool(rsi_creep),
-            }
-
-            st.markdown("**Latest diagnostics**")
+    with st.expander(sym, expanded=sym in ["$BPSPX", "$SPXA50R"]):
+        left, right = st.columns([1.7, 1.0])
+        with left:
+            st.plotly_chart(price_fig, use_container_width=True)
+            st.plotly_chart(osc_fig, use_container_width=True)
+        with right:
             st.json(diag)
 
 
 # ============================================================
-# QA / CHAT
+# CHATGPT API
 # ============================================================
-st.subheader("Narrative / Chat")
-q = st.text_input(
-    "Ask about the breadth state",
-    placeholder="Is the Qwen repair trigger on? Is this leverage-ready? What stage are we in?",
-)
+st.subheader("ChatGPT Interpretation")
 
-if q:
-    ql = q.lower()
-    answer = []
+prompt = build_llm_prompt(snapshot, prev_snapshot, thresholds, upload_history_df, weekly_df)
 
-    if "repair trigger" in ql or "qwen" in ql:
-        if repair_trigger_on:
-            answer.append(
-                f"Qwen repair trigger is active because BPSPX %B is {fmt_num(get_snapshot_val(snapshot, '$BPSPX_%B'))} and SPXA50R is {fmt_num(get_snapshot_val(snapshot, '$SPXA50R'))}."
+if show_prompt:
+    st.text_area("Prompt", prompt, height=260)
+
+client, api_key, model_name = get_openai_client()
+
+if run_llm:
+    if client is None:
+        st.warning("OPENAI_API_KEY not found in Streamlit secrets.")
+    else:
+        try:
+            with st.spinner("Running ChatGPT analysis..."):
+                llm_text = call_openai_analysis(client, model_name, prompt)
+            st.markdown(llm_text)
+
+            append_jsonl(
+                LLM_HISTORY_PATH,
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "model": model_name,
+                    "prompt": prompt,
+                    "response": llm_text,
+                },
             )
-        else:
-            answer.append(
-                f"Qwen repair trigger is not active because BPSPX %B is {fmt_num(get_snapshot_val(snapshot, '$BPSPX_%B'))} and SPXA50R is {fmt_num(get_snapshot_val(snapshot, '$SPXA50R'))}."
-            )
-
-    if "stage" in ql:
-        answer.append(f"Current regime stage is Stage {stage_num}: {stage_name}.")
-
-    if "rsp" in ql:
-        answer.append("RSP is cleaner than leverage when the repair trigger is on and participation is broadening.")
-
-    if "ursp" in ql or "spxl" in ql or "leverage" in ql:
-        answer.append("Leverage is best reserved for repair trigger on, BPSPX > 45, and NYSI improving enough to reduce structural fragility.")
-
-    if "short" in ql:
-        answer.append("Shorts are cleaner on failed bounce setups than on fresh panic lows in this framework.")
-
-    if "thrust" in ql:
-        answer.append(
-            f"NYAD is {fmt_num(get_snapshot_val(snapshot, '$NYAD'), 0)} and SPXADP is {fmt_num(get_snapshot_val(snapshot, '$SPXADP'), 1)}."
-        )
-
-    if not answer:
-        answer.append(build_narrative(snapshot, prev_snapshot))
-
-    st.write(" ".join(answer))
+        except Exception as e:
+            st.error(f"OpenAI API call failed: {e}")
+else:
+    st.info("Enable 'Run ChatGPT analysis' in the sidebar to call the API.")
 
 
 # ============================================================
-# DOWNLOAD
+# BASELINE STATUS
+# ============================================================
+st.subheader("Stored Baseline Status")
+st.json(baseline_meta if baseline_meta else {"status": "No metadata found"})
+
+
+# ============================================================
+# DOWNLOADS
 # ============================================================
 st.subheader("Downloads")
 parsed_csv = hist_feat.to_csv(index=False).encode("utf-8")
 st.download_button(
-    "Download parsed historical CSV",
+    "Download parsed historical features",
     data=parsed_csv,
-    file_name="parsed_breadth_history.csv",
+    file_name="parsed_breadth_features.csv",
     mime="text/csv",
 )
+
+upload_hist_df = load_upload_history()
+if not upload_hist_df.empty:
+    st.download_button(
+        "Download upload history",
+        data=upload_hist_df.to_csv(index=False).encode("utf-8"),
+        file_name="breadth_upload_history.csv",
+        mime="text/csv",
+    )
