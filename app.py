@@ -351,6 +351,17 @@ def recompute_latest_indicators_from_realtime(hist_feat: pd.DataFrame, realtime_
 # ============================================================
 # HISTORY / SNAPSHOTS
 # ============================================================
+
+def load_upload_history() -> pd.DataFrame:
+    if not UPLOAD_HISTORY_PATH.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(UPLOAD_HISTORY_PATH)
+    except Exception:
+        return pd.DataFrame()
+
+
+
 def append_upload_history(row: Dict):
     hist = load_upload_history()
     hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
