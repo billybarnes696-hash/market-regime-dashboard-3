@@ -1505,8 +1505,10 @@ with tab2:
         p5.metric("Exposure", f"{stats.get('Exposure %', np.nan)}%")
 
         fig_price = go.Figure()
-        fig_price.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["SPY"], name="SPY", line=dict(width=2.2)))
-        fig_price.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10), title="SPY", template="plotly_dark")
+        asset_label = "RSP" if "RSP" in backtest_df.columns else ("SPY" if "SPY" in backtest_df.columns else None)
+        if asset_label is not None:
+            fig_price.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df[asset_label], name=asset_label, line=dict(width=2.2)))
+        fig_price.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10), title=f"{asset_label or 'Asset'}", template="plotly_dark")
 
         fig_osc = go.Figure()
         fig_osc.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["osc"], name="Breadth Oscillator", line=dict(width=2.2)))
@@ -1517,7 +1519,9 @@ with tab2:
 
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["equity_strategy"], name="Strategy", line=dict(width=2.4)))
-        fig_eq.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["equity_spy"], name="Buy & Hold", line=dict(width=2.0)))
+        buyhold_col = "equity_buyhold" if "equity_buyhold" in backtest_df.columns else ("equity_spy" if "equity_spy" in backtest_df.columns else None)
+        if buyhold_col is not None:
+            fig_eq.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df[buyhold_col], name="Buy & Hold", line=dict(width=2.0)))
         fig_eq.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10), title="Equity Curves", template="plotly_dark")
 
         st.plotly_chart(fig_price, use_container_width=True)
