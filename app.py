@@ -11,11 +11,12 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import yfinance as yf
 
 # -----------------------------
 # Page + Styling
 # -----------------------------
-st.set_page_config(page_title="RSP / URSP Breadth Model v2", layout="wide", page_icon="📈")
+st.set_page_config(page_title="RSP / URSP Breadth Model v4", layout="wide", page_icon="📈")
 
 CUSTOM_CSS = """
 <style>
@@ -152,8 +153,8 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 st.markdown(
     """
     <div class="main-title">
-      <div style="font-size:1.55rem;font-weight:900;">📈 RSP / URSP Breadth Model v2</div>
-      <div class="small-muted">Transition-aware breadth engine with NYMO proxy governance, bounce quality, action hierarchy, and polished decision visuals.</div>
+      <div style="font-size:1.55rem;font-weight:900;">📈 RSP / URSP Breadth Model v4</div>
+      <div class="small-muted">Transition-aware breadth engine with NYMO proxy governance, bounce quality, action hierarchy, polished decision visuals, and a canary-overlay backtest for RSP.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -206,6 +207,18 @@ DECISION_SYMBOLS = [
     "$CPCE", "$NYHL", "RSP:SPY", "VXX", "RSP", "URSP", "SPY",
 ]
 CHART_SYMBOLS = ["$BPSPX", "$SPXA50R", "$NYMO", "$NYSI", "$NYAD", "$CPCE", "RSP", "SPY", "VXX"]
+
+CANARY_TICKERS = ("RSP", "SPY", "HYG", "SHY", "SMH", "SOXX", "XLF", "IWM", "XLY", "SPXS", "SVOL", "VXX")
+CANARY_RATIO_CONFIG = {
+    "SPXS:SVOL (Stress/Carry)": {"num": "SPXS", "den": "SVOL", "invert": True,  "weight": 0.20},
+    "HYG:SHY (Credit)":         {"num": "HYG",  "den": "SHY",  "invert": False, "weight": 0.18},
+    "SMH:SPY (Semis Lead)":     {"num": "SMH",  "den": "SPY",  "invert": False, "weight": 0.16},
+    "XLF:SPY (Financials)":     {"num": "XLF",  "den": "SPY",  "invert": False, "weight": 0.12},
+    "RSP:SPY (Breadth Lead)":   {"num": "RSP",  "den": "SPY",  "invert": False, "weight": 0.12},
+    "IWM:SPY (Small Caps)":     {"num": "IWM",  "den": "SPY",  "invert": False, "weight": 0.10},
+    "SPY:VXX (Vol Confirm)":    {"num": "SPY",  "den": "VXX",  "invert": False, "weight": 0.07},
+    "XLY:SPY (Discretionary)":  {"num": "XLY",  "den": "SPY",  "invert": False, "weight": 0.05},
+}
 
 # -----------------------------
 # Helpers
@@ -882,6 +895,133 @@ def dynamic_trading_checklist(snapshot: Dict[str, float], thresholds: Dict[str, 
 # -----------------------------
 # Charts / backtest
 # -----------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_canary_prices(tickers: tuple, years: int = 3) -> pd.DataFrame:
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.Timedelta(days=int(years * 365.25) + 40)
+    data = yf.download(
+        tickers=list(tickers),
+        start=start,
+        end=end + pd.Timedelta(days=1),
+        auto_adjust=True,
+        progress=False,
+        group_by="ticker",
+        threads=True,
+    )
+    close_cols = {}
+    if isinstance(data.columns, pd.MultiIndex):
+        for t in tickers:
+            try:
+                close_cols[t] = pd.to_numeric(data[t]["Close"], errors="coerce")
+            except Exception:
+                pass
+    else:
+        try:
+            close_cols[tickers[0]] = pd.to_numeric(data["Close"], errors="coerce")
+        except Exception:
+            pass
+    out = pd.DataFrame(close_cols).sort_index().ffill().dropna(how="all")
+    return out
+
+def macd_hist_series(close: pd.Series, fast: int = 24, slow: int = 52, signal: int = 18) -> pd.Series:
+    mline = ema(close, fast) - ema(close, slow)
+    sig = ema(mline, signal)
+    return mline - sig
+
+def close_only_stoch(close: pd.Series, length: int = 14, smoothk: int = 3, smoothd: int = 3):
+    lo = close.rolling(length).min()
+    hi = close.rolling(length).max()
+    denom = (hi - lo).replace(0, np.nan)
+    k = 100.0 * (close - lo) / denom
+    k = k.rolling(smoothk).mean()
+    d = k.rolling(smoothd).mean()
+    return k, d
+
+def close_only_cci(close: pd.Series, length: int = 100) -> pd.Series:
+    sma = close.rolling(length).mean()
+    mad = (close - sma).abs().rolling(length).mean()
+    return (close - sma) / (0.015 * mad.replace(0, np.nan))
+
+def indicator_pack_ratio(close: pd.Series) -> pd.DataFrame:
+    close = close.dropna()
+    if len(close) < 220:
+        return pd.DataFrame()
+    macdh = macd_hist_series(close).rename("macdh")
+    tsi_raw, _ = true_strength_index(close, 40, 20, 10)
+    tsi_raw = tsi_raw.rename("tsi")
+    stoch_k, _ = close_only_stoch(close, 14, 3, 3)
+    stoch_k = stoch_k.rename("stochk")
+    cci100 = close_only_cci(close, 100).rename("cci")
+    return pd.concat([macdh, tsi_raw, stoch_k, cci100], axis=1).dropna()
+
+def score_from_indicators_ratio(ind: pd.DataFrame) -> pd.Series:
+    if ind.empty:
+        return pd.Series(dtype=float)
+    bull = (ind["macdh"] > 0) & (ind["tsi"] > 0) & (ind["stochk"] > 50) & (ind["cci"] > 0)
+    bear = (ind["macdh"] < 0) & (ind["tsi"] < 0) & (ind["stochk"] < 50) & (ind["cci"] < 0)
+    sc = pd.Series(0.0, index=ind.index)
+    sc[bull] = 1.0
+    sc[bear] = -1.0
+    return sc
+
+def make_ratio(close_df: pd.DataFrame, num: str, den: str) -> pd.Series:
+    if num not in close_df.columns or den not in close_df.columns:
+        return pd.Series(dtype=float)
+    return (close_df[num] / close_df[den]).replace([np.inf, -np.inf], np.nan).dropna()
+
+def build_canary_composite(close_df: pd.DataFrame):
+    scores = {}
+    for name, cfg in CANARY_RATIO_CONFIG.items():
+        ratio = make_ratio(close_df, cfg["num"], cfg["den"])
+        ind = indicator_pack_ratio(ratio)
+        sc = score_from_indicators_ratio(ind)
+        if sc.empty:
+            continue
+        if cfg["invert"]:
+            sc = -sc
+        scores[name] = sc
+    if not scores:
+        return pd.DataFrame(), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=bool)
+    common_idx = None
+    for sc in scores.values():
+        common_idx = sc.index if common_idx is None else common_idx.intersection(sc.index)
+    if common_idx is None or len(common_idx) == 0:
+        return pd.DataFrame(), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=bool)
+    scores_df = pd.DataFrame({k: v.loc[common_idx] for k, v in scores.items()}).dropna()
+    if scores_df.empty:
+        return pd.DataFrame(), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=bool), pd.Series(dtype=bool)
+    weights = pd.Series({k: CANARY_RATIO_CONFIG[k]["weight"] for k in scores_df.columns})
+    weights = weights / weights.sum()
+    composite = (scores_df * weights).sum(axis=1)
+    comp_sign = np.sign(composite.replace(0, np.nan))
+    align = (np.sign(scores_df).replace(0, np.nan).eq(comp_sign, axis=0)).mean(axis=1).fillna(0)
+    strength = scores_df.abs().mean(axis=1)
+    confidence = ((0.6 * align) + (0.4 * strength)) * 100.0
+    credit_gate = scores_df.get("HYG:SHY (Credit)", pd.Series(index=scores_df.index, data=np.nan)) > 0
+    stress_gate = scores_df.get("SPXS:SVOL (Stress/Carry)", pd.Series(index=scores_df.index, data=np.nan)) > 0
+    return scores_df, composite, confidence, credit_gate.fillna(False), stress_gate.fillna(False)
+
+def attach_canary_overlay(backtest_df: pd.DataFrame, years: int = 3, buy_thr: float = 0.05, conf_thr: float = 55.0, trend_window: int = 3):
+    try:
+        close_df = fetch_canary_prices(CANARY_TICKERS, years=years)
+    except Exception as e:
+        return backtest_df.copy(), {"enabled": False, "warning": f"Canary fetch failed: {e}"}, pd.DataFrame()
+    scores_df, composite, confidence, credit_gate, stress_gate = build_canary_composite(close_df)
+    if composite.empty:
+        return backtest_df.copy(), {"enabled": False, "warning": "Canary overlay unavailable; insufficient ratio history."}, pd.DataFrame()
+    overlay = pd.DataFrame({
+        "date": pd.to_datetime(composite.index),
+        "canary_comp": composite.values,
+        "canary_conf": confidence.reindex(composite.index).values,
+        "canary_credit": credit_gate.reindex(composite.index).astype(int).values,
+        "canary_stress": stress_gate.reindex(composite.index).astype(int).values,
+    }).sort_values("date")
+    overlay["canary_trend"] = overlay["canary_comp"] - overlay["canary_comp"].shift(trend_window)
+    overlay["canary_ok_raw"] = (overlay["canary_comp"] > buy_thr) & (overlay["canary_trend"] > 0) & (overlay["canary_conf"] >= conf_thr) & (overlay["canary_credit"] == 1) & (overlay["canary_stress"] == 1)
+    x = pd.merge_asof(backtest_df.sort_values("date"), overlay, on="date", direction="backward")
+    x["canary_ok_raw"] = x["canary_ok_raw"].fillna(False)
+    x["held_blended"] = ((x["regime"] > 0) & x["canary_ok_raw"]).shift(1).fillna(False).astype(int)
+    return x, {"enabled": True, "warning": None, "scores_df": scores_df, "overlay": overlay}, scores_df.tail(1).T.reset_index().rename(columns={"index":"Ratio", scores_df.index[-1]:"Signal"})
 def detect_candle_pattern(row: pd.Series) -> str:
     rng = row["high"] - row["low"]
     if pd.isna(rng) or rng == 0:
@@ -953,7 +1093,7 @@ def make_symbol_chart(hist_feat: pd.DataFrame, sym: str, bb_lift: float, realtim
 def build_historical_score_series(hist_feat: pd.DataFrame, thresholds: Dict[str, float], use_proxy_backtest: bool) -> pd.DataFrame:
     dates = sorted(pd.to_datetime(hist_feat["date"].dropna().unique()))
     rows = []
-    for idx, dt in enumerate(dates):
+    for dt in dates:
         g = hist_feat[hist_feat["date"] == dt]
         snap = {}
         for _, row in g.iterrows():
@@ -981,6 +1121,7 @@ def build_historical_score_series(hist_feat: pd.DataFrame, thresholds: Dict[str,
             "confirmation_score": conf,
             "regime_score": regime,
             "breadth_score": total,
+            "RSP": safe_float(snap.get("RSP", np.nan)),
             "SPY": safe_float(snap.get("SPY", np.nan)),
             "snapshot": snap,
         })
@@ -999,21 +1140,25 @@ def build_oscillator(df: pd.DataFrame, fast: int, slow: int, signal: int, deadba
     x["held"] = x["regime"].shift(1).fillna(0)
     return x
 
-def run_backtest(df: pd.DataFrame, switch_cost_bps: float = 0.0):
+def run_backtest(df: pd.DataFrame, asset_col: str = "RSP", held_col: str = "held", switch_cost_bps: float = 0.0):
     x = df.copy()
-    x["spy_ret"] = x["SPY"].pct_change().fillna(0)
-    x["switch"] = x["held"].diff().abs().fillna(0)
+    if asset_col not in x.columns:
+        raise ValueError(f"Missing asset column for backtest: {asset_col}")
+    x["asset_ret"] = x[asset_col].pct_change().fillna(0)
+    x["switch"] = x[held_col].diff().abs().fillna(0)
     x["cost"] = (switch_cost_bps / 10000.0) * x["switch"]
-    x["strategy_ret"] = x["held"] * x["spy_ret"] - x["cost"]
+    x["strategy_ret"] = x[held_col] * x["asset_ret"] - x["cost"]
     x["equity_strategy"] = (1 + x["strategy_ret"]).cumprod()
-    x["equity_spy"] = (1 + x["spy_ret"]).cumprod()
+    x["equity_buyhold"] = (1 + x["asset_ret"]).cumprod()
+    dd_strategy = (x["equity_strategy"] / x["equity_strategy"].cummax()) - 1
+    dd_bh = (x["equity_buyhold"] / x["equity_buyhold"].cummax()) - 1
     stats = {
         "Strategy Return %": round(float((x["equity_strategy"].iloc[-1] - 1) * 100), 2) if len(x) else np.nan,
-        "BuyHold Return %": round(float((x["equity_spy"].iloc[-1] - 1) * 100), 2) if len(x) else np.nan,
-        "Strategy Max DD %": round(float((((x["equity_strategy"] / x["equity_strategy"].cummax()) - 1).min()) * 100), 2) if len(x) else np.nan,
-        "BuyHold Max DD %": round(float((((x["equity_spy"] / x["equity_spy"].cummax()) - 1).min()) * 100), 2) if len(x) else np.nan,
+        "BuyHold Return %": round(float((x["equity_buyhold"].iloc[-1] - 1) * 100), 2) if len(x) else np.nan,
+        "Strategy Max DD %": round(float(dd_strategy.min() * 100), 2) if len(x) else np.nan,
+        "BuyHold Max DD %": round(float(dd_bh.min() * 100), 2) if len(x) else np.nan,
         "Switches": int(x["switch"].sum()) if len(x) else 0,
-        "Exposure %": round(float(100 * x["held"].mean()), 1) if len(x) else np.nan,
+        "Exposure %": round(float(100 * x[held_col].mean()), 1) if len(x) else np.nan,
     }
     return x, stats
 
@@ -1098,6 +1243,10 @@ with st.sidebar:
     deadband = st.number_input("Deadband", value=0.0, step=0.1, format="%.2f")
     switch_cost_bps = st.number_input("Switch cost (bps)", value=0.0, step=1.0, format="%.1f")
     use_proxy_backtest = st.toggle("Use proxy logic in backtest", value=False)
+    use_canary_overlay = st.toggle("Blend canary overlay into Tab 2", value=True, help="Adds a ratio-canary regime filter to the breadth oscillator backtest and trades RSP instead of SPY.")
+    canary_buy_thr = st.number_input("Canary composite buy threshold", value=0.05, step=0.01, format="%.2f")
+    canary_conf_thr = st.number_input("Canary confidence threshold", value=55.0, step=1.0, format="%.1f")
+    canary_trend_window = st.number_input("Canary trend window", min_value=1, max_value=10, value=3, step=1)
 
     st.markdown("---")
     st.subheader("Decision Charts")
@@ -1192,10 +1341,33 @@ if not score_series.empty:
     max_date = score_series["date"].max()
     score_series = score_series[score_series["date"] >= (max_date - pd.Timedelta(days=365))].reset_index(drop=True)
     score_series = build_oscillator(score_series, fast_ema, slow_ema, signal_ema, deadband)
-    backtest_df, stats = run_backtest(score_series, switch_cost_bps=switch_cost_bps)
+    backtest_df, stats = run_backtest(score_series, asset_col="RSP", held_col="held", switch_cost_bps=switch_cost_bps)
+    if use_canary_overlay and not backtest_df.empty:
+        backtest_df, canary_meta, canary_latest_components = attach_canary_overlay(backtest_df, years=3, buy_thr=canary_buy_thr, conf_thr=canary_conf_thr, trend_window=canary_trend_window)
+        if canary_meta.get("enabled"):
+            backtest_df["switch_blended"] = backtest_df["held_blended"].diff().abs().fillna(0)
+            backtest_df["cost_blended"] = (switch_cost_bps / 10000.0) * backtest_df["switch_blended"]
+            backtest_df["strategy_ret_blended"] = backtest_df["held_blended"] * backtest_df["asset_ret"] - backtest_df["cost_blended"]
+            backtest_df["equity_blended"] = (1 + backtest_df["strategy_ret_blended"]).cumprod()
+            dd_blended = (backtest_df["equity_blended"] / backtest_df["equity_blended"].cummax()) - 1
+            blended_stats = {
+                "Blended Return %": round(float((backtest_df["equity_blended"].iloc[-1] - 1) * 100), 2),
+                "Blended Max DD %": round(float(dd_blended.min() * 100), 2),
+                "Blended Switches": int(backtest_df["switch_blended"].sum()),
+                "Blended Exposure %": round(float(100 * backtest_df["held_blended"].mean()), 1),
+            }
+        else:
+            blended_stats = {}
+    else:
+        canary_meta = {"enabled": False, "warning": None}
+        canary_latest_components = pd.DataFrame()
+        blended_stats = {}
 else:
     backtest_df = pd.DataFrame()
     stats = {}
+    canary_meta = {"enabled": False, "warning": None}
+    canary_latest_components = pd.DataFrame()
+    blended_stats = {}
 
 # -----------------------------
 # Main UI
