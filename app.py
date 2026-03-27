@@ -43,12 +43,87 @@ CUSTOM_CSS = """
   margin-bottom: 1rem;
 }
 .soft-card{
-  background: linear-gradient(180deg, rgba(17,25,54,.92), rgba(10,17,38,.95));
-  border: 1px solid rgba(148,163,184,.18);
+  background: linear-gradient(180deg, rgba(17,25,54,.96), rgba(10,17,38,.98));
+  border: 1px solid rgba(148,163,184,.24);
   border-radius: 18px;
-  padding: 1rem 1rem .85rem 1rem;
-  box-shadow: 0 10px 35px rgba(0,0,0,.18);
+  padding: 1rem 1rem .95rem 1rem;
+  box-shadow: 0 10px 35px rgba(0,0,0,.22);
 }
+.score-card{
+  min-height: 170px;
+  display:flex;
+  flex-direction:column;
+  justify-content:space-between;
+}
+.score-title{
+  color:#bcd0ff;
+  font-size:1.05rem;
+  font-weight:800;
+  letter-spacing:.02em;
+}
+.score-value{
+  font-size:3.15rem;
+  line-height:1.0;
+  font-weight:950;
+  color:#ffffff;
+  margin:.35rem 0 .35rem 0;
+  letter-spacing:-.03em;
+}
+.score-subtitle{
+  font-size:1.02rem;
+  font-weight:800;
+}
+.score-bar{
+  width:100%;
+  height:12px;
+  border-radius:999px;
+  background:rgba(255,255,255,.10);
+  overflow:hidden;
+  border:1px solid rgba(255,255,255,.08);
+  margin-top:.65rem;
+}
+.score-fill{
+  height:100%;
+  border-radius:999px;
+}
+.score-fill-green{background:linear-gradient(90deg,#22c55e,#4ade80);}
+.score-fill-yellow{background:linear-gradient(90deg,#f59e0b,#fbbf24);}
+.score-fill-red{background:linear-gradient(90deg,#ef4444,#f87171);}
+.score-fill-blue{background:linear-gradient(90deg,#38bdf8,#60a5fa);}
+.kpi-row{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:.75rem;
+  margin-top:.85rem;
+}
+.kpi-box{
+  background:rgba(255,255,255,.04);
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:14px;
+  padding:.8rem .85rem;
+}
+.kpi-label{
+  color:#9fb2de;
+  font-size:.9rem;
+  font-weight:700;
+}
+.kpi-value{
+  color:white;
+  font-size:1.85rem;
+  font-weight:900;
+  line-height:1.05;
+  margin-top:.15rem;
+}
+.action-box{
+  border-radius:16px;
+  padding:.85rem 1rem;
+  margin:.5rem 0;
+  border:1px solid rgba(255,255,255,.10);
+}
+.action-existing{background:rgba(56,189,248,.10);}
+.action-new{background:rgba(245,158,11,.10);}
+.action-add{background:rgba(34,197,94,.10);}
+.big-code pre{font-size:1.02rem !important; line-height:1.45 !important;}
 .pill{
   display:inline-block;
   padding:.3rem .6rem;
@@ -942,14 +1017,33 @@ def run_backtest(df: pd.DataFrame, switch_cost_bps: float = 0.0):
     }
     return x, stats
 
-def metric_card(title: str, value: str, subtitle: str = "", tone: str = "blue"):
-    cls = {"green":"pill-green","yellow":"pill-yellow","red":"pill-red","blue":"pill-blue"}.get(tone,"pill-blue")
+def metric_card(title: str, value: str, subtitle: str = "", tone: str = "blue", pct: float = 0.0):
+    fill_cls = {"green":"score-fill-green","yellow":"score-fill-yellow","red":"score-fill-red","blue":"score-fill-blue"}.get(tone,"score-fill-blue")
+    pct = max(0.0, min(100.0, pct))
     st.markdown(
         f"""
-        <div class="soft-card">
-          <div class="small-muted">{title}</div>
-          <div style="font-size:1.9rem;font-weight:900;margin:.1rem 0 .15rem 0;">{value}</div>
-          <span class="pill {cls}">{subtitle}</span>
+        <div class="soft-card score-card">
+          <div>
+            <div class="score-title">{title}</div>
+            <div class="score-value">{value}</div>
+            <div class="score-subtitle">{subtitle}</div>
+          </div>
+          <div>
+            <div class="score-bar"><div class="score-fill {fill_cls}" style="width:{pct}%;"></div></div>
+            <div class="small-muted" style="margin-top:.45rem;">{pct:.0f}% of max score</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def kpi_box(label: str, value: str):
+    st.markdown(
+        f"""
+        <div class="kpi-box">
+          <div class="kpi-label">{label}</div>
+          <div class="kpi-value">{value}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1109,35 +1203,53 @@ else:
 tab1, tab2 = st.tabs(["Decision Dashboard", "Score Oscillator Backtest"])
 
 with tab1:
-    top1, top2, top3, top4 = st.columns(4)
-    with top1:
-        metric_card("Setup", f"{setup_score}/{SETUP_MAX}", "washout + lift", score_tone(setup_score * 2))
-    with top2:
-        metric_card("Confirmation", f"{confirmation_score}/{CONFIRM_MAX}", "repair quality", score_tone(confirmation_score * 2))
-    with top3:
-        metric_card("Regime", f"{regime_score}/{REGIME_MAX}", "durability", score_tone(regime_score * 2))
-    with top4:
-        metric_card("Total", f"{total_score}/{TOTAL_MAX}", f"bounce quality {bounce_quality_score}/10", score_tone(total_score))
+    row1c1, row1c2 = st.columns(2)
+    with row1c1:
+        metric_card("Setup", f"{setup_score}/{SETUP_MAX}", "washout + lift", score_tone(setup_score * 2), (setup_score / SETUP_MAX) * 100)
+    with row1c2:
+        metric_card("Confirmation", f"{confirmation_score}/{CONFIRM_MAX}", "repair quality", score_tone(confirmation_score * 2), (confirmation_score / CONFIRM_MAX) * 100)
+
+    row2c1, row2c2 = st.columns(2)
+    with row2c1:
+        metric_card("Regime", f"{regime_score}/{REGIME_MAX}", "durability", score_tone(regime_score * 2), (regime_score / REGIME_MAX) * 100)
+    with row2c2:
+        metric_card("Total", f"{total_score}/{TOTAL_MAX}", f"bounce quality {bounce_quality_score}/10", score_tone(total_score), (total_score / TOTAL_MAX) * 100)
+
+    st.markdown('<div class="soft-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">At-a-Glance Numbers</div>', unsafe_allow_html=True)
+    k1, k2, k3 = st.columns(3)
+    stage_num, stage_name = breadth_stage(snapshot, thresholds, nymo_effective.get("value", np.nan))
+    with k1:
+        kpi_box("Bounce Quality", f"{bounce_quality_score}/10")
+    with k2:
+        kpi_box("NYMO Source", nymo_effective["label"] + f": {fmt_num(nymo_effective['value'])}")
+    with k3:
+        kpi_box("Stage", f"{stage_num} - {stage_name}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
     a1, a2 = st.columns([0.62, 0.38])
     with a1:
         st.markdown('<div class="soft-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Action Hierarchy</div>', unsafe_allow_html=True)
         st.markdown(f"""
-        <div style="font-size:1.05rem;"><b>Existing:</b> {action_hierarchy['existing']}</div>
-        <div style="font-size:1.05rem;"><b>New:</b> {action_hierarchy['new']}</div>
-        <div style="font-size:1.05rem;"><b>Add:</b> {action_hierarchy['add']}</div>
-        <div class="small-muted" style="margin-top:.55rem;">{action_hierarchy['rationale']}</div>
+        <div class="action-box action-existing"><b>Existing:</b> {action_hierarchy['existing']}</div>
+        <div class="action-box action-new"><b>New:</b> {action_hierarchy['new']}</div>
+        <div class="action-box action-add"><b>Add:</b> {action_hierarchy['add']}</div>
+        <div class="small-muted" style="margin-top:.55rem; font-size:1rem;">{action_hierarchy['rationale']}</div>
         """, unsafe_allow_html=True)
+        st.markdown('<div class="kpi-row">', unsafe_allow_html=True)
         s1, s2, s3 = st.columns(3)
-        s1.metric("Suggested RSP", f"{int(action_hierarchy['rsp_size']*100)}%")
-        s2.metric("Suggested URSP", f"{int(action_hierarchy['ursp_size']*100)}%")
-        stage_num, stage_name = breadth_stage(snapshot, thresholds, nymo_effective.get("value", np.nan))
-        s3.metric("Stage", f"{stage_num} - {stage_name}")
+        with s1:
+            kpi_box("Suggested RSP", f"{int(action_hierarchy['rsp_size']*100)}%")
+        with s2:
+            kpi_box("Suggested URSP", f"{int(action_hierarchy['ursp_size']*100)}%")
+        with s3:
+            kpi_box("Stage", f"{stage_num} - {stage_name}")
+        st.markdown('</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown("")
-        st.markdown('<div class="soft-card">', unsafe_allow_html=True)
+        st.markdown('<div class="soft-card big-code">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Trading Checklist</div>', unsafe_allow_html=True)
         st.code(checklist_text, language="text")
         st.markdown('</div>', unsafe_allow_html=True)
